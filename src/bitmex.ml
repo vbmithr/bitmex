@@ -4,23 +4,54 @@ open Core
 open Async
 open Cohttp_async
 
-open Dtc.Dtc
-
 open Bs_devkit
-open Bs_api.BMEX
-open Util
+open Bmex
 
-(* Helper functions only useful here *)
+module DTC = Dtc_pb.Dtcprotocol_piqi
+module WS = Bmex_ws
+module REST = Bmex_rest
 
-let b64_of_uuid uuid_str =
-  match Uuidm.of_string uuid_str with
-  | None -> invalid_arg "Uuidm.of_string"
-  | Some uuid -> Uuidm.to_bytes uuid |> B64.encode
+let rec loop_log_errors ?log f =
+  let rec inner () =
+    Monitor.try_with_or_error ~name:"loop_log_errors" f >>= function
+    | Ok _ -> assert false
+    | Error err ->
+      Option.iter log ~f:(fun log -> Log.error log "run: %s" @@ Error.to_string_hum err);
+      inner ()
+  in inner ()
 
-let uuid_of_b64 b64 =
-  B64.decode b64 |> Uuidm.of_bytes |> function
-  | None -> invalid_arg "uuid_of_b64"
-  | Some uuid -> Uuidm.to_string uuid
+let conduit_server ~tls ~crt_path ~key_path =
+  if tls then
+    Sys.file_exists crt_path >>= fun crt_exists ->
+    Sys.file_exists key_path >>| fun key_exists ->
+    match crt_exists, key_exists with
+    | `Yes, `Yes -> `OpenSSL (`Crt_file_path crt_path, `Key_file_path key_path)
+    | _ -> failwith "TLS crt/key file not found"
+  else
+  return `TCP
+
+let price_display_format_of_ticksize tickSize =
+  if tickSize >=. 1. then `price_display_format_decimal_0
+  else if tickSize =. 1e-1 then `price_display_format_decimal_1
+  else if tickSize =. 1e-2 then `price_display_format_decimal_2
+  else if tickSize =. 1e-3 then `price_display_format_decimal_3
+  else if tickSize =. 1e-4 then `price_display_format_decimal_4
+  else if tickSize =. 1e-5 then `price_display_format_decimal_5
+  else if tickSize =. 1e-6 then `price_display_format_decimal_6
+  else if tickSize =. 1e-7 then `price_display_format_decimal_7
+  else if tickSize =. 1e-8 then `price_display_format_decimal_8
+  else if tickSize =. 1e-9 then `price_display_format_decimal_9
+  else invalid_argf "price_display_format_of_ticksize: %f" tickSize ()
+
+let write_message w (typ : DTC.dtcmessage_type) gen msg =
+  let typ =
+    Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
+  let msg = (gen msg |> Piqirun.to_string) in
+  let header = Bytes.create 4 in
+  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
+  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
+  Writer.write w header ;
+  Writer.write w msg
 
 module IS = struct
   module T = struct
@@ -48,20 +79,19 @@ module Instrument = struct
                  to_int_ns_since_epoch |>
                  (fun t -> t / 1_000_000_000) |>
                  Int32.of_int_exn)) in
-    let open SecurityDefinition in
-    Response.create
-      ~symbol
-      ~exchange
-      ~security_type:(if index then Index else Futures)
-      ~descr:""
-      ~min_price_increment:tickSize
-      ~price_display_format:(price_display_format_of_ticksize tickSize)
-      ~currency_value_per_increment:tickSize
-      ~underlying_symbol:(string_exn t "underlyingSymbol")
-      ~updates_bid_ask_only:false
-      ~has_market_depth_data:(not index)
-      ?expiration_date
-      ()
+    let secdef = DTC.default_security_definition_response () in
+    secdef.symbol <- Some symbol ;
+    secdef.exchange <- Some exchange ;
+    secdef.security_type <-
+      Some (if index then `security_type_index else `security_type_future) ;
+    secdef.min_price_increment <- Some tickSize ;
+    secdef.currency_value_per_increment <- Some tickSize ;
+    secdef.price_display_format <- Some (price_display_format_of_ticksize tickSize) ;
+    secdef.has_market_depth_data <- Some (not index) ;
+    secdef.underlying_symbol <- Some (string_exn t "underlyingSymbol") ;
+    secdef.updates_bid_ask_only <- Some false ;
+    secdef.security_expiration_date <- expiration_date ;
+    secdef
 end
 
 let bitmex_historical = ref ""
@@ -77,7 +107,7 @@ let log_ws = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stder
 
 type instr = {
   mutable instrObj: RespObj.t;
-  secdef: SecurityDefinition.Response.t;
+  secdef: DTC.Security_definition_response.t ;
   mutable last_trade_price: float;
   mutable last_trade_size: int;
   mutable last_trade_ts: Time_ns.t;
@@ -101,8 +131,8 @@ type client = {
   addr: Socket.Address.Inet.t;
   addr_str: string;
   w: Writer.t;
-  ws_r: Ws.update Pipe.Reader.t;
-  ws_w: Ws.update Pipe.Writer.t;
+  ws_r: WS.Response.Update.t Pipe.Reader.t;
+  ws_w: WS.Response.Update.t Pipe.Writer.t;
   mutable ws_uuid: Uuid.t;
   key: string;
   secret: Cstruct.t;
@@ -112,7 +142,7 @@ type client = {
   mutable dropped: int;
   subs: int String.Table.t;
   subs_depth: int String.Table.t;
-  mutable current_parent: Trading.Order.Submit.t option;
+  mutable current_parent: DTC.Submit_new_single_order.t option;
   parents: string String.Table.t;
   stop_exec_inst: [`MarkPrice | `LastPrice];
 }
@@ -120,9 +150,9 @@ type client = {
 let clients : client InetAddr.Table.t = InetAddr.Table.create ()
 
 let set_parent_order client order =
-  let open Trading.Order.Submit in
   client.current_parent <- Some order;
-  String.Table.set client.parents order.cli_ord_id order.cli_ord_id
+  Option.iter order.client_order_id
+    ~f:(fun id -> String.Table.set client.parents id id)
 
 type book_entry = {
   price: float;
@@ -147,20 +177,24 @@ let orderbooks : books String.Table.t = String.Table.create ()
 let quotes : Quote.t String.Table.t = String.Table.create ()
 
 let heartbeat { addr_str; w; dropped } ival =
-  let open Logon.Heartbeat in
-  let cs = Cstruct.create sizeof_cs in
+  let msg = DTC.default_heartbeat () in
   let rec loop () =
     Clock_ns.after @@ Time_ns.Span.of_int_sec ival >>= fun () ->
     Log.debug log_dtc "-> [%s] HB" addr_str;
-    write ~dropped_msgs:dropped cs;
-    Writer.write_cstruct w cs;
+    msg.num_dropped_messages <- Some (Int32.of_int_exn dropped) ;
+    write_message w `heartbeat DTC.gen_heartbeat msg ;
     loop ()
   in
   Monitor.try_with_or_error ~name:"heatbeat" loop >>| function
   | Error _ -> Log.error log_dtc "-/-> %s HB" addr_str
   | Ok _ -> ()
 
-let write_order_update ~nb_msgs ~msg_number cs e =
+
+let write_order_update ~nb_msgs ~msg_number w e =
+  let seconds_of_ts_string ts =
+    Time_ns.(to_int_ns_since_epoch (of_string ts) / 1_000_000_000) |>
+    Int64.of_int
+  in
   let invalid_arg' execType ordStatus =
     invalid_arg Printf.(sprintf "write_order_update: execType=%s, ordStatus=%s" execType ordStatus)
   in
@@ -169,75 +203,85 @@ let write_order_update ~nb_msgs ~msg_number cs e =
     let ordStatus = RespObj.(string_exn e "ordStatus") in
     if execType = ordStatus then
       match execType with
-      | "New" -> `Open, UpdateReason.New_order_accepted
-      | "PartiallyFilled" -> `Open, Partially_filled
-      | "Filled" -> `Filled, Filled
-      | "DoneForDay" -> `Open, General_order_update
-      | "Canceled" -> `Canceled, Canceled
-      | "PendingCancel" -> `Pending_cancel, General_order_update
-      | "Stopped" -> `Open, General_order_update
-      | "Rejected" -> `Rejected, New_order_rejected
-      | "PendingNew" -> `Pending_open, General_order_update
-      | "Expired" -> `Rejected, New_order_rejected
+      | "New" -> `order_status_open, `new_order_accepted
+      | "PartiallyFilled" -> `order_status_open, `order_filled_partially
+      | "Filled" -> `order_status_filled, `order_filled
+      | "DoneForDay" -> `order_status_open, `general_order_update
+      | "Canceled" -> `order_status_canceled, `order_canceled
+      | "PendingCancel" -> `order_status_pending_cancel, `general_order_update
+      | "Stopped" -> `order_status_open, `general_order_update
+      | "Rejected" -> `order_status_rejected, `new_order_rejected
+      | "PendingNew" -> `order_status_pending_open, `general_order_update
+      | "Expired" -> `order_status_rejected, `new_order_rejected
       | _ -> invalid_arg' execType ordStatus
     else
       match execType, ordStatus with
       | "Restated", _ ->
         (match ordStatus with
-         | "New" -> `Open, General_order_update
-         | "PartiallyFilled" -> `Open, General_order_update
-         | "Filled" -> `Filled, General_order_update
-         | "DoneForDay" -> `Open, General_order_update
-         | "Canceled" -> `Canceled, General_order_update
-         | "PendingCancel" -> `Pending_cancel, General_order_update
-         | "Stopped" -> `Open, General_order_update
-         | "Rejected" -> `Rejected, General_order_update
-         | "PendingNew" -> `Pending_open, General_order_update
-         | "Expired" -> `Rejected, General_order_update
+         | "New" -> `order_status_open, `general_order_update
+         | "PartiallyFilled" -> `order_status_open, `general_order_update
+         | "Filled" -> `order_status_filled, `general_order_update
+         | "DoneForDay" -> `order_status_open, `general_order_update
+         | "Canceled" -> `order_status_canceled, `general_order_update
+         | "PendingCancel" -> `order_status_pending_cancel, `general_order_update
+         | "Stopped" -> `order_status_open, `general_order_update
+         | "Rejected" -> `order_status_rejected, `general_order_update
+         | "PendingNew" -> `order_status_pending_open, `general_order_update
+         | "Expired" -> `order_status_rejected, `general_order_update
          | _ -> invalid_arg' execType ordStatus
         )
-      | "Trade", "Filled" -> `Filled, Filled
-      | "Trade", "PartiallyFilled" -> `Filled, Partially_filled
-      | "Replaced", "New" -> `Open, Cancel_replace_complete
-      | "TriggeredOrActivatedBySystem", "New" -> `Open, New_order_accepted
+      | "Trade", "Filled" -> `order_status_filled, `order_filled
+      | "Trade", "PartiallyFilled" -> `order_status_filled, `order_filled_partially
+      | "Replaced", "New" -> `order_status_open, `order_cancel_replace_complete
+      | "TriggeredOrActivatedBySystem", "New" -> `order_status_open, `new_order_accepted
+      | "Funding", _ -> raise Exit
+      | "Settlement", _ -> raise Exit
       | _ -> invalid_arg' execType ordStatus
   in
   match status_reason_of_execType_ordStatus e with
+  | exception Exit -> ()
   | exception Invalid_argument msg ->
-    Log.error log_bitmex "Not sending order update for %s" msg;
-    false
+    Log.error log_bitmex "Not sending order update for %s" msg
   | status, reason ->
+    let u = DTC.default_order_update () in
     let price = RespObj.(float_or_null_exn ~default:Float.max_finite_value e "price") in
     let stopPx = RespObj.(float_or_null_exn ~default:Float.max_finite_value e "stopPx") in
-    let ord_type = ord_type_of_string RespObj.(string_exn e "ordType") in
+    let side = match (RespObj.string_exn e "side" |> Side.of_string) with
+      | None -> `buy_sell_unset
+      | Some `Buy -> `buy
+      | Some `Sell -> `sell in
+    let ord_type =
+      (OrderType.of_string RespObj.(string_exn e "ordType")) in
+    let tif =
+      (TimeInForce.of_string RespObj.(string_exn e "timeInForce")) in
+    let ts =
+      RespObj.(string e "transactTime" |> Option.map ~f:seconds_of_ts_string) in
     let p1, p2 = p1_p2_of_bitmex ~ord_type ~stopPx ~price in
-    Trading.Order.Update.write
-      ~nb_msgs
-      ~msg_number
-      ~symbol:RespObj.(string_exn e "symbol")
-      ~exchange:!my_exchange
-      ~cli_ord_id:RespObj.(string_exn e "clOrdID")
-      ~srv_ord_id:RespObj.(string_exn e "orderID" |> b64_of_uuid)
-      ~xch_ord_id:RespObj.(string_exn e "orderID" |> b64_of_uuid)
-      ~ord_type
-      ~status
-      ~reason
-      ?side:(RespObj.string_exn e "side" |> side_of_bmex)
-      ?p1
-      ?p2
-      ~tif:(tif_of_string RespObj.(string_exn e "timeInForce"))
-      ~order_qty:RespObj.(int64_exn e "orderQty" |> Int64.to_float)
-      ~filled_qty:RespObj.(int64_exn e "cumQty" |> Int64.to_float)
-      ~remaining_qty:RespObj.(int64_exn e "leavesQty" |> Int64.to_float)
-      ?avg_fill_p:RespObj.(float e "avgPx")
-      ?last_fill_p:RespObj.(float e "lastPx")
-      ?last_fill_ts:RespObj.(string e "transactTime" |> Option.map ~f:Time_ns.of_string)
-      ?last_fill_qty:RespObj.(int64 e "lastQty" |> Option.map ~f:Int64.to_float)
-      ~last_fill_exec_id:RespObj.(string_exn e "execID" |> b64_of_uuid)
-      ~trade_account:RespObj.(int64_exn e "account" |> Int64.to_string)
-      ~free_form_text:RespObj.(string_exn e "text")
-      cs;
-    true
+    u.total_num_messages <- Some nb_msgs ;
+    u.message_number <- Some msg_number ;
+    u.symbol <- Some RespObj.(string_exn e "symbol") ;
+    u.exchange <- Some !my_exchange ;
+    u.client_order_id <- Some RespObj.(string_exn e "clOrdID") ;
+    u.server_order_id <- Some RespObj.(string_exn e "orderID") ;
+    u.exchange_order_id <- Some RespObj.(string_exn e "orderID") ;
+    u.order_type <- Some (ord_type :> DTC.order_type_enum) ;
+    u.order_status <- Some status ;
+    u.order_update_reason <- Some reason ;
+    u.buy_sell <- Some side ;
+    u.price1 <- p1 ;
+    u.price2 <- p2 ;
+    u.time_in_force <- Some (tif :> DTC.time_in_force_enum) ;
+    u.order_quantity <- Some RespObj.(int64_exn e "orderQty" |> Int64.to_float) ;
+    u.filled_quantity <- Some RespObj.(int64_exn e "cumQty" |> Int64.to_float) ;
+    u.remaining_quantity <- Some RespObj.(int64_exn e "leavesQty" |> Int64.to_float) ;
+    u.average_fill_price <- RespObj.(float e "avgPx") ;
+    u.last_fill_price <- RespObj.(float e "lastPx") ;
+    u.last_fill_date_time <- ts ;
+    u.last_fill_quantity <- RespObj.(int64 e "lastQty" |> Option.map ~f:Int64.to_float) ;
+    u.last_fill_execution_id <- Some RespObj.(string_exn e "execID") ;
+    u.trade_account <- Some RespObj.(int64_exn e "account" |> Int64.to_string) ;
+    u.free_form_text <- Some RespObj.(string_exn e "text") ;
+    write_message w `order_update DTC.gen_order_update u
 
 let write_position_update ?request_id ~nb_msgs ~msg_number w cs p =
   let symbol = RespObj.string_exn p "symbol" in
@@ -508,28 +552,15 @@ let process addr w msg_cs scratchbuf =
       choose [ws_ok; timeout]
     in
     let stop_exec_inst = if Int32.bit_and m.integer_1 1l = 1l then `LastPrice else `MarkPrice in begin
-      match m.username, m.password, m.general_text_data with
-      | "", _, _ ->
+      match m.username, m.password with
+      | "", _ ->
         let client = create_client "" "" stop_exec_inst in
         InetAddr.Table.set clients ~key:addr ~data:client;
         accept client stop_exec_inst @@ Result.fail "No login provided, data only"
-      | key, "", secret ->
+      | key, secret ->
         let client = create_client key secret stop_exec_inst in
         InetAddr.Table.set clients ~key:addr ~data:client;
         don't_wait_for (setup_client_ws client >>| accept client stop_exec_inst)
-      | username, passwd, _ -> don't_wait_for begin
-          let exchange = Bitsouk_api.(if !use_testnet then Bitmex_testnet else Bitmex) in
-          Bitsouk.get_credentials ~log:log_dtc ~username ~passwd ~exchange () >>= function
-          | Error err ->
-            Log.error log_dtc "Bitsouk.get_credentials: %s" @@ Error.to_string_hum err;
-            let client = create_client "" "" stop_exec_inst in
-            InetAddr.Table.set clients ~key:addr ~data:client;
-            return @@ accept client stop_exec_inst Result.(fail @@ Error.to_string_hum err)
-          | Ok { accountid; key; secret } ->
-            let client = create_client key secret stop_exec_inst in
-            InetAddr.Table.set clients ~key:addr ~data:client;
-            setup_client_ws client >>| accept client stop_exec_inst
-        end
     end
 
   | Some Heartbeat ->
