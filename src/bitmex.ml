@@ -63,6 +63,54 @@ module IS = struct
   include Hashable.Make (T)
 end
 
+module Connection = struct
+  type t = {
+    addr: string;
+    w: Writer.t;
+    ws_r: WS.Response.Update.t Pipe.Reader.t;
+    ws_w: WS.Response.Update.t Pipe.Writer.t;
+    mutable ws_uuid: Uuid.t;
+    key: string;
+    secret: Cstruct.t;
+    position: RespObj.t IS.Table.t; (* indexed by account, symbol *)
+    margin: RespObj.t IS.Table.t; (* indexed by account, currency *)
+    order: RespObj.t Uuid.Table.t; (* indexed by orderID *)
+    mutable dropped: int;
+    subs: int String.Table.t;
+    subs_depth: int String.Table.t;
+    mutable current_parent: DTC.Submit_new_single_order.t option;
+    parents: string String.Table.t;
+    stop_exec_inst: ExecInst.t ;
+  }
+
+  let create ~addr ~w ~key ~secret ~stop_exec_inst =
+    let ws_r, ws_w = Pipe.create () in
+    {
+      addr ; w ; ws_r ; ws_w ; key ;
+      secret = Cstruct.of_string secret ;
+      position = IS.Table.create () ;
+      margin = IS.Table.create () ;
+      order = Uuid.Table.create () ;
+      subs = String.Table.create () ;
+      subs_depth = String.Table.create () ;
+      parents = String.Table.create () ;
+      stop_exec_inst ;
+
+      current_parent = None ;
+      ws_uuid = Uuid.create () ;
+      dropped = 0 ;
+    }
+
+  let active : t String.Table.t = String.Table.create ()
+
+  let find = String.Table.find active
+
+  let set_parent_order conn order =
+    conn.current_parent <- Some order;
+    Option.iter order.client_order_id
+      ~f:(fun id -> String.Table.set conn.parents id id)
+end
+
 module Instrument = struct
   open RespObj
   let is_index symbol = symbol.[0] = '.'
@@ -92,6 +140,30 @@ module Instrument = struct
     secdef.updates_bid_ask_only <- Some false ;
     secdef.security_expiration_date <- expiration_date ;
     secdef
+
+  type t = {
+    mutable instrObj: RespObj.t;
+    secdef: DTC.Security_definition_response.t ;
+    mutable last_trade_price: float;
+    mutable last_trade_size: int;
+    mutable last_trade_ts: Time_ns.t;
+    mutable last_quote_ts: Time_ns.t;
+  }
+
+  let create
+      ?(last_trade_price = 0.)
+      ?(last_trade_size = 0)
+      ?(last_trade_ts = Time_ns.epoch)
+      ?(last_quote_ts = Time_ns.epoch)
+      ~instrObj ~secdef () = {
+    instrObj ; secdef ;
+    last_trade_price ; last_trade_size ;
+    last_trade_ts ; last_quote_ts
+  }
+
+  let active : t String.Table.t = String.Table.create ()
+
+  let find = String.Table.find active
 end
 
 let bitmex_historical = ref ""
@@ -104,55 +176,6 @@ let my_topic = "bitsouk"
 let log_bitmex = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 let log_dtc = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 let log_ws = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
-
-type instr = {
-  mutable instrObj: RespObj.t;
-  secdef: DTC.Security_definition_response.t ;
-  mutable last_trade_price: float;
-  mutable last_trade_size: int;
-  mutable last_trade_ts: Time_ns.t;
-  mutable last_quote_ts: Time_ns.t;
-}
-
-let create_instr
-    ?(last_trade_price = 0.)
-    ?(last_trade_size = 0)
-    ?(last_trade_ts = Time_ns.epoch)
-    ?(last_quote_ts = Time_ns.epoch)
-    ~instrObj ~secdef () = {
-  instrObj ; secdef ;
-  last_trade_price ; last_trade_size ;
-  last_trade_ts ; last_quote_ts
-}
-
-let instruments : instr String.Table.t = String.Table.create ()
-
-type client = {
-  addr: Socket.Address.Inet.t;
-  addr_str: string;
-  w: Writer.t;
-  ws_r: WS.Response.Update.t Pipe.Reader.t;
-  ws_w: WS.Response.Update.t Pipe.Writer.t;
-  mutable ws_uuid: Uuid.t;
-  key: string;
-  secret: Cstruct.t;
-  position: RespObj.t IS.Table.t; (* indexed by account, symbol *)
-  margin: RespObj.t IS.Table.t; (* indexed by account, currency *)
-  order: RespObj.t Uuid.Table.t; (* indexed by orderID *)
-  mutable dropped: int;
-  subs: int String.Table.t;
-  subs_depth: int String.Table.t;
-  mutable current_parent: DTC.Submit_new_single_order.t option;
-  parents: string String.Table.t;
-  stop_exec_inst: [`MarkPrice | `LastPrice];
-}
-
-let clients : client InetAddr.Table.t = InetAddr.Table.create ()
-
-let set_parent_order client order =
-  client.current_parent <- Some order;
-  Option.iter order.client_order_id
-    ~f:(fun id -> String.Table.set client.parents id id)
 
 type book_entry = {
   price: float;
@@ -176,19 +199,19 @@ let mapify_ob table =
 let orderbooks : books String.Table.t = String.Table.create ()
 let quotes : Quote.t String.Table.t = String.Table.create ()
 
-let heartbeat { addr_str; w; dropped } ival =
+let send_heartbeat { Connection.addr; w; dropped } ival =
+  let ival = Option.value_map ival ~default:10 ~f:Int32.to_int_exn in
   let msg = DTC.default_heartbeat () in
   let rec loop () =
     Clock_ns.after @@ Time_ns.Span.of_int_sec ival >>= fun () ->
-    Log.debug log_dtc "-> [%s] HB" addr_str;
+    Log.debug log_dtc "-> [%s] HB" addr;
     msg.num_dropped_messages <- Some (Int32.of_int_exn dropped) ;
     write_message w `heartbeat DTC.gen_heartbeat msg ;
     loop ()
   in
   Monitor.try_with_or_error ~name:"heatbeat" loop >>| function
-  | Error _ -> Log.error log_dtc "-/-> %s HB" addr_str
+  | Error _ -> Log.error log_dtc "-/-> %s HB" addr
   | Ok _ -> ()
-
 
 let write_order_update ~nb_msgs ~msg_number w e =
   let seconds_of_ts_string ts =
@@ -319,12 +342,12 @@ let write_balance_update ~msg_number ~nb_msgs ~unsolicited w m =
   write_message w `account_balance_update DTC.gen_account_balance_update u
 
 type subscribe_msg =
-  | Subscribe of client
+  | Subscribe of Connection.t
   | Unsubscribe of Uuid.t * string
 
 let client_ws_r, client_ws_w = Pipe.create ()
 
-let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c) =
+let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position; } as c) =
   let order_partial_done = Ivar.create () in
   let margin_partial_done = Ivar.create () in
   let position_partial_done = Ivar.create () in
@@ -337,11 +360,11 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
       match action with
       | WS.Response.Update.Delete ->
         Uuid.Table.remove order oid;
-        Log.debug log_bitmex "<- [%s] order delete" addr_str
+        Log.debug log_bitmex "<- [%s] order delete" addr
       | Insert
       | Partial ->
         Uuid.Table.set order ~key:oid ~data:o;
-        Log.debug log_bitmex "<- [%s] order insert/partial" addr_str
+        Log.debug log_bitmex "<- [%s] order insert/partial" addr
       | Update ->
         if Ivar.is_full order_partial_done then begin
           let data = match Uuid.Table.find order oid with
@@ -349,7 +372,7 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
             | Some old_o -> RespObj.merge old_o o
           in
           Uuid.Table.set order ~key:oid ~data;
-          Log.debug log_bitmex "<- [%s] order update" addr_str
+          Log.debug log_bitmex "<- [%s] order update" addr
         end
     end;
     if action = Partial then Ivar.fill_if_empty order_partial_done ()
@@ -362,11 +385,11 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
       match action with
       | WS.Response.Update.Delete ->
         IS.Table.remove margin (a, c);
-        Log.debug log_bitmex "<- [%s] margin delete" addr_str
+        Log.debug log_bitmex "<- [%s] margin delete" addr
       | Insert
       | Partial ->
         IS.Table.set margin ~key:(a, c) ~data:m;
-        Log.debug log_bitmex "<- [%s] margin insert/partial" addr_str;
+        Log.debug log_bitmex "<- [%s] margin insert/partial" addr;
         write_balance_update ~unsolicited:true ~msg_number:1l ~nb_msgs:1l w m
       | Update ->
         if Ivar.is_full margin_partial_done then begin
@@ -376,7 +399,7 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
           in
           IS.Table.set margin ~key:(a, c) ~data:m;
           write_balance_update ~unsolicited:true ~msg_number:1l ~nb_msgs:1l w m ;
-          Log.debug log_bitmex "<- [%s] margin update" addr_str
+          Log.debug log_bitmex "<- [%s] margin update" addr
         end
     end;
     if action = Partial then Ivar.fill_if_empty margin_partial_done ()
@@ -389,12 +412,12 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
       match action with
       | WS.Response.Update.Delete ->
         IS.Table.remove position (a, s);
-        Log.debug log_bitmex "<- [%s] position delete" addr_str
+        Log.debug log_bitmex "<- [%s] position delete" addr
       | Insert | Partial ->
         IS.Table.set position ~key:(a, s) ~data:p;
         if RespObj.bool_exn p "isOpen" then begin
           write_position_update ~nb_msgs:1l ~msg_number:1l w p ;
-          Log.debug log_bitmex "<- [%s] position insert/partial" addr_str
+          Log.debug log_bitmex "<- [%s] position insert/partial" addr
         end
       | Update ->
         if Ivar.is_full position_partial_done then begin
@@ -406,7 +429,7 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
           match old_p with
           | Some old_p when RespObj.bool_exn old_p "isOpen" ->
             write_position_update ~nb_msgs:1l ~msg_number:1l w p ;
-            Log.debug log_dtc "<- [%s] position update %s" addr_str s
+            Log.debug log_dtc "<- [%s] position update %s" addr s
           | _ -> ()
         end
     end;
@@ -417,13 +440,13 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
       let symbol = RespObj.string_exn e "symbol" in
       match action with
       | WS.Response.Update.Insert ->
-        Log.debug log_bitmex "<- [%s] exec %s" addr_str symbol;
+        Log.debug log_bitmex "<- [%s] exec %s" addr symbol;
         if write_order_update ~nb_msgs:1l ~msg_number:1l w e then succ i else i
       | _ -> i
     in
     let execs = List.map execs ~f:RespObj.of_json in
     let nb_execs = List.fold_left execs ~init:0 ~f:fold_f in
-    if nb_execs > 0 then Log.debug log_dtc "-> [%s] OrderUpdate %d" addr_str nb_execs
+    if nb_execs > 0 then Log.debug log_dtc "-> [%s] OrderUpdate %d" addr nb_execs
   in
   let on_update { WS.Response.Update.table; action; data } =
     match table, action, data with
@@ -447,7 +470,108 @@ let encoding_request addr w req =
   Writer.write w ;
   Log.debug log_dtc "-> [%s] Encoding Response" addr
 
+let accept_logon_request addr w req client stop_exec_inst trading =
+  let trading_supported, result_text =
+    match trading with
+    | Ok msg -> true, Printf.sprintf "Trading enabled: %s" msg
+    | Error msg -> false, Printf.sprintf "Trading disabled: %s" msg
+  in
+  let r = DTC.default_logon_response () in
+  r.server_name <- Some "BitMEX" ;
+  r.result <- Some `logon_success ;
+  r.result_text <- Some result_text ;
+  r.security_definitions_supported <- Some true ;
+  r.market_data_supported <- Some true ;
+  r.historical_price_data_supported <- Some true ;
+  r.market_depth_is_supported <- Some true ;
+  r.market_depth_updates_best_bid_and_ask <- Some true ;
+  r.trading_is_supported <- Some trading_supported ;
+  r.order_cancel_replace_supported <- Some true ;
+  r.ocoorders_supported <- Some true ;
+  r.bracket_orders_supported <- Some true ;
+
+  don't_wait_for @@
+  send_heartbeat client req.DTC.Logon_request.heartbeat_interval_in_seconds;
+
+  write_message w `logon_response DTC.gen_logon_response r ;
+
+  Log.debug log_dtc "-> [%s] Logon Response" addr ;
+  let on_instrument { Instrument.secdef } =
+    secdef.is_final_message <- Some true ;
+    write_message w `security_definition_response
+      DTC.gen_security_definition_response secdef
+  in
+  ignore @@ String.Table.iter Instrument.active ~f:on_instrument
+
+let setup_client_ws client apikey =
+  let ws_initialized = client_ws client in
+  let ws_ok = choice ws_initialized (fun () ->
+      Log.info log_dtc "BitMEX accepts API key %s" apikey ;
+      Result.return "API key valid."
+    )
+  in
+  let timeout = choice (Clock_ns.after @@ Time_ns.Span.of_int_sec 20) (fun () ->
+      Log.info log_dtc "BitMEX rejects API key %s" apikey ;
+      Result.fail "BitMEX rejects your API key."
+    )
+  in
+  choose [ws_ok; timeout]
+
+let logon_request addr w msg =
+  let req = DTC.parse_logon_request msg in
+  Log.debug log_dtc "<- [%s] Logon Request" addr ;
+  let stop_exec_inst =
+    match req.integer_1 with
+    | Some 1l -> `LastPrice
+    | Some 2l -> `IndexPrice
+    | _ -> `MarkPrice in
+  begin
+    match req.username, req.password with
+    | Some apikey, Some secret ->
+      let conn = Connection.create addr w apikey secret stop_exec_inst in
+      String.Table.set Connection.active ~key:addr ~data:conn ;
+      don't_wait_for begin
+        setup_client_ws conn apikey >>|
+        accept_logon_request addr w req conn stop_exec_inst
+      end
+    | _ ->
+      let conn = Connection.create addr w "" "" stop_exec_inst in
+      String.Table.set Connection.active ~key:addr ~data:conn ;
+      accept_logon_request addr w req conn stop_exec_inst @@
+      Result.fail "No login provided, data only"
+  end
+
 let heartbeat addr w msg =  Log.debug log_dtc "<- [%s] Heartbeat" addr
+
+let security_definition_reject addr w request_id k = Printf.ksprintf begin fun msg ->
+    let resp = DTC.default_security_definition_reject () in
+    resp.request_id <- Some request_id ;
+    resp.reject_text <- Some msg ;
+    Log.debug log_dtc "-> [%s] Security Definition Reject" addr ;
+    write_message w `security_definition_reject DTC.gen_security_definition_reject resp
+  end k
+
+let security_definition_request addr w msg =
+  let req = DTC.parse_security_definition_for_symbol_request msg in
+  match req.request_id, req.symbol, req.exchange with
+  | Some id, Some symbol, Some exchange ->
+    Log.debug log_dtc "<- [%s] Security Definition Request %s-%s" addr symbol exchange;
+    if !my_exchange <> exchange && not Instrument.(is_index symbol) then
+      security_definition_reject addr w id "No such symbol %s-%s" symbol exchange
+    else begin
+      match Instrument.find symbol with
+      | None ->
+        security_definition_reject addr w id "No such symbol %s-%s" symbol exchange
+      | Some { secdef } ->
+        secdef.request_id <- Some id ;
+        secdef.is_final_message <- Some true ;
+        Log.debug log_dtc
+          "-> [%s] Security Definition Response %s-%s" addr symbol exchange;
+        write_message w `security_definition_response
+          DTC.gen_security_definition_response secdef
+    end
+  | _ ->
+    Log.error log_dtc "<- [%s] BAD Security Definition Request" addr
 
 (* let process addr w msg_cs scratchbuf = *)
 (*   let addr_str = Socket.Address.Inet.to_string addr in *)
@@ -476,117 +600,6 @@ let heartbeat addr w msg =  Log.debug log_dtc "<- [%s] Heartbeat" addr
 (*     Writer.write_cstruct w response_cs; *)
 (*     Log.debug log_dtc "-> [%s] EncodingResp" addr_str *)
 
-(*   | Some LogonRequest -> *)
-(*     let open Logon in *)
-(*     let m = Request.read msg_cs in *)
-(*     let response_cs = Cstruct.of_bigarray scratchbuf ~len:Response.sizeof_cs in *)
-(*     Log.debug log_dtc "<- [%s] %s" addr_str (Request.show m); *)
-(*     let create_client ~key ~secret ~stop_exec_inst = *)
-(*       let ws_r, ws_w = Pipe.create () in *)
-(*       { *)
-(*         addr ; addr_str ; w ; ws_r ; ws_w ; key ; *)
-(*         secret = Cstruct.of_string secret ; *)
-(*         position = IS.Table.create () ; *)
-(*         margin = IS.Table.create () ; *)
-(*         order = Uuid.Table.create () ; *)
-(*         subs = String.Table.create () ; *)
-(*         subs_depth = String.Table.create () ; *)
-(*         parents = String.Table.create () ; *)
-(*         stop_exec_inst ; *)
-
-(*         current_parent = None ; *)
-(*         ws_uuid = Uuid.create () ; *)
-(*         dropped = 0 ; *)
-(*       } *)
-(*     in *)
-(*     let accept client stop_exec_inst trading = *)
-(*       let trading_supported, result_text = *)
-(*         match trading with *)
-(*         | Ok msg -> true, Printf.sprintf "Trading enabled: %s" msg *)
-(*         | Error msg -> false, Printf.sprintf "Trading disabled: %s" msg *)
-(*       in *)
-(*       let resp = *)
-(*         Response.create *)
-(*           ~server_name:"BitMEX" *)
-(*           ~result:LogonStatus.Success *)
-(*           ~result_text *)
-(*           ~security_definitions_supported:true *)
-(*           ~market_data_supported:true *)
-(*           ~historical_price_data_supported:true *)
-(*           ~market_depth_supported:true *)
-(*           ~market_depth_updates_best_bid_and_ask:true *)
-(*           ~trading_supported *)
-(*           ~ocr_supported:true *)
-(*           ~oco_supported:true *)
-(*           ~bracket_orders_supported:true *)
-(*           () *)
-(*       in *)
-(*       don't_wait_for @@ heartbeat client m.Request.heartbeat_interval; *)
-(*       Response.to_cstruct response_cs resp; *)
-(*       Writer.write_cstruct w response_cs; *)
-(*       Log.debug log_dtc "-> [%s] %s" addr_str (Response.show resp); *)
-(*       let secdef_resp_cs = Cstruct.of_bigarray scratchbuf ~len:SecurityDefinition.Response.sizeof_cs in *)
-(*       let on_instrument { secdef } = *)
-(*         SecurityDefinition.Response.to_cstruct secdef_resp_cs { secdef with final = true }; *)
-(*         Writer.write_cstruct w secdef_resp_cs *)
-(*       in *)
-(*       ignore @@ String.Table.iter instruments ~f:on_instrument *)
-(*     in *)
-(*     let setup_client_ws client = *)
-(*       let ws_initialized = client_ws client in *)
-(*       let ws_ok = choice ws_initialized (fun () -> *)
-(*           Log.info log_dtc "BitMEX accepts API key for %s" m.username; *)
-(*           Result.return "API key valid." *)
-(*         ) *)
-(*       in *)
-(*       let timeout = choice (Clock_ns.after @@ Time_ns.Span.of_int_sec 20) (fun () -> *)
-(*           Log.info log_dtc "BitMEX rejects API key for %s" m.username; *)
-(*           Result.fail "BitMEX rejects your API key." *)
-(*         ) *)
-(*       in *)
-(*       choose [ws_ok; timeout] *)
-(*     in *)
-(*     let stop_exec_inst = if Int32.bit_and m.integer_1 1l = 1l then `LastPrice else `MarkPrice in begin *)
-(*       match m.username, m.password with *)
-(*       | "", _ -> *)
-(*         let client = create_client "" "" stop_exec_inst in *)
-(*         InetAddr.Table.set clients ~key:addr ~data:client; *)
-(*         accept client stop_exec_inst @@ Result.fail "No login provided, data only" *)
-(*       | key, secret -> *)
-(*         let client = create_client key secret stop_exec_inst in *)
-(*         InetAddr.Table.set clients ~key:addr ~data:client; *)
-(*         don't_wait_for (setup_client_ws client >>| accept client stop_exec_inst) *)
-(*     end *)
-
-(*   | Some Heartbeat -> *)
-(*     Option.iter client ~f:begin fun { addr_str } -> *)
-(*       Log.debug log_dtc "<- [%s] HB" addr_str *)
-(*     end *)
-
-(*   | Some SecurityDefinitionForSymbolRequest -> *)
-(*     let open SecurityDefinition in *)
-(*     let { Request.id; symbol; exchange } = Request.read msg_cs in *)
-(*     let { addr_str; _ } = Option.value_exn client in *)
-(*     Log.debug log_dtc "<- [%s] SeqDefReq %s-%s" addr_str symbol exchange; *)
-(*     let reject_cs = Cstruct.of_bigarray scratchbuf ~len:Reject.sizeof_cs in *)
-(*     let reject k = Printf.ksprintf begin fun msg -> *)
-(*         Reject.write reject_cs ~request_id:id "%s" msg; *)
-(*         Log.debug log_dtc "-> [%s] SeqDefRej" addr_str; *)
-(*         Writer.write_cstruct w reject_cs *)
-(*       end k *)
-(*     in *)
-(*     if !my_exchange <> exchange && not Instrument.(is_index symbol) then *)
-(*       reject "No such symbol %s-%s" symbol exchange *)
-(*     else begin match String.Table.find instruments symbol with *)
-(*     | None -> reject "No such symbol %s-%s" symbol exchange *)
-(*     | Some { secdef } -> *)
-(*       let open Response in *)
-(*       let secdef = { secdef with request_id = id; final = true } in *)
-(*       Log.debug log_dtc "-> [%s] %s" addr_str (show secdef); *)
-(*       let secdef_resp_cs = Cstruct.of_bigarray scratchbuf ~len:sizeof_cs in *)
-(*       Response.to_cstruct secdef_resp_cs secdef; *)
-(*       Writer.write_cstruct w secdef_resp_cs *)
-(*     end *)
 
 (*   | Some MarketDataRequest -> *)
 (*     let open MarketData in *)
