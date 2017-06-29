@@ -1,0 +1,6 @@
+(executable
+ ((name bitmex)
+  (public_name bitmex)
+  (modules bitmex)
+  (preprocess (pps (ppx_sexp_conv)))
+  (libraries (dtc-pb bmex-rest bmex-ws))))
