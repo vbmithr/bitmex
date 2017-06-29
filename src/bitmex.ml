@@ -239,9 +239,10 @@ let write_order_update ~nb_msgs ~msg_number w e =
       | _ -> invalid_arg' execType ordStatus
   in
   match status_reason_of_execType_ordStatus e with
-  | exception Exit -> ()
+  | exception Exit -> false
   | exception Invalid_argument msg ->
-    Log.error log_bitmex "Not sending order update for %s" msg
+    Log.error log_bitmex "Not sending order update for %s" msg ;
+    false
   | status, reason ->
     let u = DTC.default_order_update () in
     let price = RespObj.(float_or_null_exn ~default:Float.max_finite_value e "price") in
@@ -281,41 +282,41 @@ let write_order_update ~nb_msgs ~msg_number w e =
     u.last_fill_execution_id <- Some RespObj.(string_exn e "execID") ;
     u.trade_account <- Some RespObj.(int64_exn e "account" |> Int64.to_string) ;
     u.free_form_text <- Some RespObj.(string_exn e "text") ;
-    write_message w `order_update DTC.gen_order_update u
+    write_message w `order_update DTC.gen_order_update u ;
+    true
 
-let write_position_update ?request_id ~nb_msgs ~msg_number w cs p =
+let write_position_update ?request_id ~nb_msgs ~msg_number w p =
   let symbol = RespObj.string_exn p "symbol" in
   let trade_account = RespObj.int_exn p "account" in
   let avgEntryPrice = RespObj.float_exn p "avgEntryPrice" in
   let currentQty = RespObj.int_exn p "currentQty" in
-  Trading.Position.Update.write
-    ~nb_msgs
-    ~msg_number
-    ?request_id
-    ~symbol
-    ~exchange:!my_exchange
-    ~trade_account:(Int.to_string trade_account)
-    ~p:avgEntryPrice
-    ~v:(Int.to_float currentQty)
-    cs;
-  (* Log.debug log_dtc "-> position %s %d %f %d" symbol trade_account avgEntryPrice currentQty; *)
-  Writer.write_cstruct w cs
+  let u = DTC.default_position_update () in
+  u.total_number_messages <- Some nb_msgs ;
+  u.message_number <- Some msg_number ;
+  u.request_id <- request_id ;
+  u.symbol <- Some symbol ;
+  u.exchange <- Some !my_exchange ;
+  u.trade_account <- Some (Int.to_string trade_account) ;
+  u.average_price <- Some avgEntryPrice ;
+  u.quantity <- Some (Int.to_float currentQty) ;
+  write_message w `position_update DTC.gen_position_update u
 
-let write_balance_update ~msg_number ~nb_msgs ~unsolicited cs m =
-  let open Account.Balance.Update in
-  write
-    ~nb_msgs
-    ~msg_number
-    ~currency:"mXBT"
-    ~cash_balance:RespObj.(Int64.(to_float @@ int64_exn m "walletBalance") /. 1e5)
-    ~balance_available:RespObj.(Int64.(to_float @@ int64_exn m "availableMargin") /. 1e5)
-    ~securities_value:RespObj.(Int64.(to_float @@ int64_exn m "marginBalance") /. 1e5)
-    ~margin_requirement:RespObj.(Int64.(
-        to_float (int64_exn m "initMargin" +
-                  int64_exn m "maintMargin" +
-                  int64_exn m "sessionMargin") /. 1e5))
-    ~trade_account:RespObj.(int64_exn m "account" |> Int64.to_string)
-    cs
+let write_balance_update ~msg_number ~nb_msgs ~unsolicited w m =
+  let u = DTC.default_account_balance_update () in
+  u.total_number_messages <- Some nb_msgs ;
+  u.message_number <- Some msg_number ;
+  u.account_currency <- Some "mXBT" ;
+  u.cash_balance <- Some RespObj.(Int64.(to_float @@ int64_exn m "walletBalance") /. 1e5) ;
+  u.balance_available_for_new_positions <-
+    Some RespObj.(Int64.(to_float @@ int64_exn m "availableMargin") /. 1e5) ;
+  u.securities_value <-
+    Some RespObj.(Int64.(to_float @@ int64_exn m "marginBalance") /. 1e5) ;
+  u.margin_requirement <- RespObj.(Int64.(
+      Some (to_float (int64_exn m "initMargin" +
+                      int64_exn m "maintMargin" +
+                      int64_exn m "sessionMargin") /. 1e5))) ;
+  u.trade_account <- Some RespObj.(int64_exn m "account" |> Int64.to_string) ;
+  write_message w `account_balance_update DTC.gen_account_balance_update u
 
 type subscribe_msg =
   | Subscribe of client
@@ -324,10 +325,6 @@ type subscribe_msg =
 let client_ws_r, client_ws_w = Pipe.create ()
 
 let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c) =
-  let scratchbuf = Bigstring.create 4096 in
-  let position_update_cs = Cstruct.of_bigarray scratchbuf ~len:Trading.Position.Update.sizeof_cs in
-  let order_update_cs = Cstruct.of_bigarray scratchbuf ~len:Trading.Order.Update.sizeof_cs in
-  let balance_update_cs = Cstruct.of_bigarray scratchbuf ~len:Account.Balance.Update.sizeof_cs in
   let order_partial_done = Ivar.create () in
   let margin_partial_done = Ivar.create () in
   let position_partial_done = Ivar.create () in
@@ -338,13 +335,14 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
       let oid = RespObj.string_exn o "orderID" in
       let oid = Uuid.of_string oid in
       match action with
-      | "delete" ->
+      | WS.Response.Update.Delete ->
         Uuid.Table.remove order oid;
         Log.debug log_bitmex "<- [%s] order delete" addr_str
-      | "insert" | "partial" ->
+      | Insert
+      | Partial ->
         Uuid.Table.set order ~key:oid ~data:o;
         Log.debug log_bitmex "<- [%s] order insert/partial" addr_str
-      | "update" ->
+      | Update ->
         if Ivar.is_full order_partial_done then begin
           let data = match Uuid.Table.find order oid with
             | None -> o
@@ -353,9 +351,8 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
           Uuid.Table.set order ~key:oid ~data;
           Log.debug log_bitmex "<- [%s] order update" addr_str
         end
-      | _ -> invalid_arg @@ "process_orders: unknown action " ^ action
     end;
-    if action = "partial" then Ivar.fill_if_empty order_partial_done ()
+    if action = Partial then Ivar.fill_if_empty order_partial_done ()
   in
   let process_margins action margins =
     let margins = List.map margins ~f:RespObj.of_json in
@@ -363,30 +360,26 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
       let a = RespObj.int_exn m "account" in
       let c = RespObj.string_exn m "currency" in
       match action with
-      | "delete" ->
+      | WS.Response.Update.Delete ->
         IS.Table.remove margin (a, c);
         Log.debug log_bitmex "<- [%s] margin delete" addr_str
-      | "insert" | "partial" ->
+      | Insert
+      | Partial ->
         IS.Table.set margin ~key:(a, c) ~data:m;
         Log.debug log_bitmex "<- [%s] margin insert/partial" addr_str;
-        write_balance_update ~unsolicited:true ~msg_number:1 ~nb_msgs:1
-          balance_update_cs m;
-        Writer.write_cstruct w balance_update_cs;
-      | "update" ->
+        write_balance_update ~unsolicited:true ~msg_number:1l ~nb_msgs:1l w m
+      | Update ->
         if Ivar.is_full margin_partial_done then begin
           let m = match IS.Table.find margin (a, c) with
             | None -> m
             | Some old_m -> RespObj.merge old_m m
           in
           IS.Table.set margin ~key:(a, c) ~data:m;
-          write_balance_update ~unsolicited:true ~msg_number:1 ~nb_msgs:1
-            balance_update_cs m;
-          Writer.write_cstruct w balance_update_cs;
+          write_balance_update ~unsolicited:true ~msg_number:1l ~nb_msgs:1l w m ;
           Log.debug log_bitmex "<- [%s] margin update" addr_str
         end
-      | _ -> invalid_arg @@ "process_margins: unknown action " ^ action
     end;
-    if action = "partial" then Ivar.fill_if_empty margin_partial_done ()
+    if action = Partial then Ivar.fill_if_empty margin_partial_done ()
   in
   let process_positions action positions =
     let positions = List.map positions ~f:RespObj.of_json in
@@ -394,16 +387,16 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
       let a = RespObj.int_exn p "account" in
       let s = RespObj.string_exn p "symbol" in
       match action with
-      | "delete" ->
+      | WS.Response.Update.Delete ->
         IS.Table.remove position (a, s);
         Log.debug log_bitmex "<- [%s] position delete" addr_str
-      | "insert" | "partial" ->
+      | Insert | Partial ->
         IS.Table.set position ~key:(a, s) ~data:p;
         if RespObj.bool_exn p "isOpen" then begin
-          write_position_update ~nb_msgs:1 ~msg_number:1 w position_update_cs p;
+          write_position_update ~nb_msgs:1l ~msg_number:1l w p ;
           Log.debug log_bitmex "<- [%s] position insert/partial" addr_str
         end
-      | "update" ->
+      | Update ->
         if Ivar.is_full position_partial_done then begin
           let old_p, p = match IS.Table.find position (a, s) with
             | None -> None, p
@@ -412,35 +405,27 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
           IS.Table.set position ~key:(a, s) ~data:p;
           match old_p with
           | Some old_p when RespObj.bool_exn old_p "isOpen" ->
-            write_position_update ~nb_msgs:1 ~msg_number:1 w position_update_cs p;
+            write_position_update ~nb_msgs:1l ~msg_number:1l w p ;
             Log.debug log_dtc "<- [%s] position update %s" addr_str s
           | _ -> ()
         end
-      | _ -> invalid_arg @@ "process_positions: unknown action " ^ action
     end;
-    if action = "partial" then Ivar.fill_if_empty position_partial_done ()
+    if action = Partial then Ivar.fill_if_empty position_partial_done ()
   in
   let process_execs action execs =
     let fold_f i e =
       let symbol = RespObj.string_exn e "symbol" in
       match action with
-      | "insert" ->
+      | WS.Response.Update.Insert ->
         Log.debug log_bitmex "<- [%s] exec %s" addr_str symbol;
-        if write_order_update ~nb_msgs:1 ~msg_number:1 order_update_cs e then begin
-          Writer.write_cstruct w order_update_cs;
-          succ i
-        end
-        else i
+        if write_order_update ~nb_msgs:1l ~msg_number:1l w e then succ i else i
       | _ -> i
     in
     let execs = List.map execs ~f:RespObj.of_json in
     let nb_execs = List.fold_left execs ~init:0 ~f:fold_f in
     if nb_execs > 0 then Log.debug log_dtc "-> [%s] OrderUpdate %d" addr_str nb_execs
   in
-  let on_update { Ws.table; action; data } =
-    let open Ws in
-    (* Erase scratchbuf by security. *)
-    Bigstring.set_tail_padded_fixed_string scratchbuf ~padding:'\x00' ~pos:0 ~len:(Bigstring.length scratchbuf) "";
+  let on_update { WS.Response.Update.table; action; data } =
     match table, action, data with
       | "order", action, orders -> process_orders action orders
       | "margin", action, margins -> process_margins action margins
@@ -452,931 +437,1004 @@ let client_ws ({ addr_str; w; ws_r; key; secret; order; margin; position; } as c
   don't_wait_for @@ Monitor.handle_errors
     (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws_r ~f:on_update)
     (fun exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn);
-  Deferred.all_unit (List.map ~f:Ivar.read [order_partial_done; position_partial_done; margin_partial_done])
+  Deferred.all_unit (List.map ~f:Ivar.read [order_partial_done;
+                                            position_partial_done;
+                                            margin_partial_done])
 
-let process addr w msg_cs scratchbuf =
-  let addr_str = Socket.Address.Inet.to_string addr in
-  (* Erase scratchbuf by security. *)
-  Bigstring.set_tail_padded_fixed_string
-    scratchbuf ~padding:'\x00' ~pos:0 ~len:(Bigstring.length scratchbuf) "";
-  let msg = msg_of_enum Cstruct.LE.(get_uint16 msg_cs 2) in
-  let client = match msg with
-    | None -> None
-    | Some EncodingRequest -> None
-    | Some LogonRequest -> None
-    | Some msg -> begin
-        match InetAddr.Table.find clients addr with
-        | None ->
-          Log.error log_dtc "msg type %s and found no client record" (show_msg msg);
-          failwith "internal error: no client record"
-        | Some client -> Some client
-      end
-  in
-  match msg with
-  | Some EncodingRequest ->
-    let open Encoding in
-    Log.debug log_dtc "<- [%s] EncodingReq" addr_str;
-    let response_cs = Cstruct.of_bigarray scratchbuf ~len:Response.sizeof_cs in
-    Response.write response_cs;
-    Writer.write_cstruct w response_cs;
-    Log.debug log_dtc "-> [%s] EncodingResp" addr_str
+let encoding_request addr w req =
+  Log.debug log_dtc "<- [%s] Encoding Request" addr ;
+  Dtc_pb.Encoding.(to_string (Response { version = 7 ; encoding = Protobuf })) |>
+  Writer.write w ;
+  Log.debug log_dtc "-> [%s] Encoding Response" addr
 
-  | Some LogonRequest ->
-    let open Logon in
-    let m = Request.read msg_cs in
-    let response_cs = Cstruct.of_bigarray scratchbuf ~len:Response.sizeof_cs in
-    Log.debug log_dtc "<- [%s] %s" addr_str (Request.show m);
-    let create_client ~key ~secret ~stop_exec_inst =
-      let ws_r, ws_w = Pipe.create () in
-      {
-        addr ; addr_str ; w ; ws_r ; ws_w ; key ;
-        secret = Cstruct.of_string secret ;
-        position = IS.Table.create () ;
-        margin = IS.Table.create () ;
-        order = Uuid.Table.create () ;
-        subs = String.Table.create () ;
-        subs_depth = String.Table.create () ;
-        parents = String.Table.create () ;
-        stop_exec_inst ;
+let heartbeat addr w msg =  Log.debug log_dtc "<- [%s] Heartbeat" addr
 
-        current_parent = None ;
-        ws_uuid = Uuid.create () ;
-        dropped = 0 ;
-      }
-    in
-    let accept client stop_exec_inst trading =
-      let trading_supported, result_text =
-        match trading with
-        | Ok msg -> true, Printf.sprintf "Trading enabled: %s" msg
-        | Error msg -> false, Printf.sprintf "Trading disabled: %s" msg
-      in
-      let resp =
-        Response.create
-          ~server_name:"BitMEX"
-          ~result:LogonStatus.Success
-          ~result_text
-          ~security_definitions_supported:true
-          ~market_data_supported:true
-          ~historical_price_data_supported:true
-          ~market_depth_supported:true
-          ~market_depth_updates_best_bid_and_ask:true
-          ~trading_supported
-          ~ocr_supported:true
-          ~oco_supported:true
-          ~bracket_orders_supported:true
-          ()
-      in
-      don't_wait_for @@ heartbeat client m.Request.heartbeat_interval;
-      Response.to_cstruct response_cs resp;
-      Writer.write_cstruct w response_cs;
-      Log.debug log_dtc "-> [%s] %s" addr_str (Response.show resp);
-      let secdef_resp_cs = Cstruct.of_bigarray scratchbuf ~len:SecurityDefinition.Response.sizeof_cs in
-      let on_instrument { secdef } =
-        SecurityDefinition.Response.to_cstruct secdef_resp_cs { secdef with final = true };
-        Writer.write_cstruct w secdef_resp_cs
-      in
-      ignore @@ String.Table.iter instruments ~f:on_instrument
-    in
-    let setup_client_ws client =
-      let ws_initialized = client_ws client in
-      let ws_ok = choice ws_initialized (fun () ->
-          Log.info log_dtc "BitMEX accepts API key for %s" m.username;
-          Result.return "API key valid."
-        )
-      in
-      let timeout = choice (Clock_ns.after @@ Time_ns.Span.of_int_sec 20) (fun () ->
-          Log.info log_dtc "BitMEX rejects API key for %s" m.username;
-          Result.fail "BitMEX rejects your API key."
-        )
-      in
-      choose [ws_ok; timeout]
-    in
-    let stop_exec_inst = if Int32.bit_and m.integer_1 1l = 1l then `LastPrice else `MarkPrice in begin
-      match m.username, m.password with
-      | "", _ ->
-        let client = create_client "" "" stop_exec_inst in
-        InetAddr.Table.set clients ~key:addr ~data:client;
-        accept client stop_exec_inst @@ Result.fail "No login provided, data only"
-      | key, secret ->
-        let client = create_client key secret stop_exec_inst in
-        InetAddr.Table.set clients ~key:addr ~data:client;
-        don't_wait_for (setup_client_ws client >>| accept client stop_exec_inst)
-    end
+(* let process addr w msg_cs scratchbuf = *)
+(*   let addr_str = Socket.Address.Inet.to_string addr in *)
+(*   (\* Erase scratchbuf by security. *\) *)
+(*   Bigstring.set_tail_padded_fixed_string *)
+(*     scratchbuf ~padding:'\x00' ~pos:0 ~len:(Bigstring.length scratchbuf) ""; *)
+(*   let msg = msg_of_enum Cstruct.LE.(get_uint16 msg_cs 2) in *)
+(*   let client = match msg with *)
+(*     | None -> None *)
+(*     | Some EncodingRequest -> None *)
+(*     | Some LogonRequest -> None *)
+(*     | Some msg -> begin *)
+(*         match InetAddr.Table.find clients addr with *)
+(*         | None -> *)
+(*           Log.error log_dtc "msg type %s and found no client record" (show_msg msg); *)
+(*           failwith "internal error: no client record" *)
+(*         | Some client -> Some client *)
+(*       end *)
+(*   in *)
+(*   match msg with *)
+(*   | Some EncodingRequest -> *)
+(*     let open Encoding in *)
+(*     Log.debug log_dtc "<- [%s] EncodingReq" addr_str; *)
+(*     let response_cs = Cstruct.of_bigarray scratchbuf ~len:Response.sizeof_cs in *)
+(*     Response.write response_cs; *)
+(*     Writer.write_cstruct w response_cs; *)
+(*     Log.debug log_dtc "-> [%s] EncodingResp" addr_str *)
 
-  | Some Heartbeat ->
-    Option.iter client ~f:begin fun { addr_str } ->
-      Log.debug log_dtc "<- [%s] HB" addr_str
-    end
+(*   | Some LogonRequest -> *)
+(*     let open Logon in *)
+(*     let m = Request.read msg_cs in *)
+(*     let response_cs = Cstruct.of_bigarray scratchbuf ~len:Response.sizeof_cs in *)
+(*     Log.debug log_dtc "<- [%s] %s" addr_str (Request.show m); *)
+(*     let create_client ~key ~secret ~stop_exec_inst = *)
+(*       let ws_r, ws_w = Pipe.create () in *)
+(*       { *)
+(*         addr ; addr_str ; w ; ws_r ; ws_w ; key ; *)
+(*         secret = Cstruct.of_string secret ; *)
+(*         position = IS.Table.create () ; *)
+(*         margin = IS.Table.create () ; *)
+(*         order = Uuid.Table.create () ; *)
+(*         subs = String.Table.create () ; *)
+(*         subs_depth = String.Table.create () ; *)
+(*         parents = String.Table.create () ; *)
+(*         stop_exec_inst ; *)
 
-  | Some SecurityDefinitionForSymbolRequest ->
-    let open SecurityDefinition in
-    let { Request.id; symbol; exchange } = Request.read msg_cs in
-    let { addr_str; _ } = Option.value_exn client in
-    Log.debug log_dtc "<- [%s] SeqDefReq %s-%s" addr_str symbol exchange;
-    let reject_cs = Cstruct.of_bigarray scratchbuf ~len:Reject.sizeof_cs in
-    let reject k = Printf.ksprintf begin fun msg ->
-        Reject.write reject_cs ~request_id:id "%s" msg;
-        Log.debug log_dtc "-> [%s] SeqDefRej" addr_str;
-        Writer.write_cstruct w reject_cs
-      end k
-    in
-    if !my_exchange <> exchange && not Instrument.(is_index symbol) then
-      reject "No such symbol %s-%s" symbol exchange
-    else begin match String.Table.find instruments symbol with
-    | None -> reject "No such symbol %s-%s" symbol exchange
-    | Some { secdef } ->
-      let open Response in
-      let secdef = { secdef with request_id = id; final = true } in
-      Log.debug log_dtc "-> [%s] %s" addr_str (show secdef);
-      let secdef_resp_cs = Cstruct.of_bigarray scratchbuf ~len:sizeof_cs in
-      Response.to_cstruct secdef_resp_cs secdef;
-      Writer.write_cstruct w secdef_resp_cs
-    end
+(*         current_parent = None ; *)
+(*         ws_uuid = Uuid.create () ; *)
+(*         dropped = 0 ; *)
+(*       } *)
+(*     in *)
+(*     let accept client stop_exec_inst trading = *)
+(*       let trading_supported, result_text = *)
+(*         match trading with *)
+(*         | Ok msg -> true, Printf.sprintf "Trading enabled: %s" msg *)
+(*         | Error msg -> false, Printf.sprintf "Trading disabled: %s" msg *)
+(*       in *)
+(*       let resp = *)
+(*         Response.create *)
+(*           ~server_name:"BitMEX" *)
+(*           ~result:LogonStatus.Success *)
+(*           ~result_text *)
+(*           ~security_definitions_supported:true *)
+(*           ~market_data_supported:true *)
+(*           ~historical_price_data_supported:true *)
+(*           ~market_depth_supported:true *)
+(*           ~market_depth_updates_best_bid_and_ask:true *)
+(*           ~trading_supported *)
+(*           ~ocr_supported:true *)
+(*           ~oco_supported:true *)
+(*           ~bracket_orders_supported:true *)
+(*           () *)
+(*       in *)
+(*       don't_wait_for @@ heartbeat client m.Request.heartbeat_interval; *)
+(*       Response.to_cstruct response_cs resp; *)
+(*       Writer.write_cstruct w response_cs; *)
+(*       Log.debug log_dtc "-> [%s] %s" addr_str (Response.show resp); *)
+(*       let secdef_resp_cs = Cstruct.of_bigarray scratchbuf ~len:SecurityDefinition.Response.sizeof_cs in *)
+(*       let on_instrument { secdef } = *)
+(*         SecurityDefinition.Response.to_cstruct secdef_resp_cs { secdef with final = true }; *)
+(*         Writer.write_cstruct w secdef_resp_cs *)
+(*       in *)
+(*       ignore @@ String.Table.iter instruments ~f:on_instrument *)
+(*     in *)
+(*     let setup_client_ws client = *)
+(*       let ws_initialized = client_ws client in *)
+(*       let ws_ok = choice ws_initialized (fun () -> *)
+(*           Log.info log_dtc "BitMEX accepts API key for %s" m.username; *)
+(*           Result.return "API key valid." *)
+(*         ) *)
+(*       in *)
+(*       let timeout = choice (Clock_ns.after @@ Time_ns.Span.of_int_sec 20) (fun () -> *)
+(*           Log.info log_dtc "BitMEX rejects API key for %s" m.username; *)
+(*           Result.fail "BitMEX rejects your API key." *)
+(*         ) *)
+(*       in *)
+(*       choose [ws_ok; timeout] *)
+(*     in *)
+(*     let stop_exec_inst = if Int32.bit_and m.integer_1 1l = 1l then `LastPrice else `MarkPrice in begin *)
+(*       match m.username, m.password with *)
+(*       | "", _ -> *)
+(*         let client = create_client "" "" stop_exec_inst in *)
+(*         InetAddr.Table.set clients ~key:addr ~data:client; *)
+(*         accept client stop_exec_inst @@ Result.fail "No login provided, data only" *)
+(*       | key, secret -> *)
+(*         let client = create_client key secret stop_exec_inst in *)
+(*         InetAddr.Table.set clients ~key:addr ~data:client; *)
+(*         don't_wait_for (setup_client_ws client >>| accept client stop_exec_inst) *)
+(*     end *)
 
-  | Some MarketDataRequest ->
-    let open MarketData in
-    let { Request.action; symbol_id; symbol; exchange } = Request.read msg_cs in
-    Log.debug log_dtc "<- [%s] MarketDataReq %s %s-%s" addr_str (RequestAction.show action) symbol exchange;
-    let { addr_str; subs; _ } = Option.value_exn client in
-    let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in
-    let reject k = Printf.ksprintf begin fun reason ->
-        Reject.write r_cs ~symbol_id "%s" reason;
-        Log.debug log_dtc "-> [%s] Market Data Reject: %s" addr_str reason;
-        Writer.write_cstruct w r_cs
-      end k
-    in
-    let snap_of_instr { instrObj; last_trade_price; last_trade_size; last_trade_ts; last_quote_ts } =
-      if action = Unsubscribe then String.Table.remove subs symbol;
-      if action = Subscribe then String.Table.set subs symbol symbol_id;
-      if Instrument.is_index symbol then
-        Snapshot.create
-          ~symbol_id:symbol_id
-          ?session_settlement_price:(RespObj.float instrObj "prevPrice24h")
-          ?last_trade_p:(RespObj.float instrObj "lastPrice")
-          ?last_trade_ts:(RespObj.string instrObj "timestamp" |> Option.map ~f:Time_ns.of_string)
-          ()
-      else
-        (* let open RespObj in *)
-        let { Quote.bidPrice; bidSize; askPrice; askSize } = String.Table.find_exn quotes symbol in
-        let open RespObj in
-        Snapshot.create
-          ~symbol_id
-          ~session_settlement_price:Option.(value ~default:Float.max_finite_value (float instrObj "indicativeSettlePrice"))
-          ~session_h:Option.(value ~default:Float.max_finite_value @@ float instrObj "highPrice")
-          ~session_l:Option.(value ~default:Float.max_finite_value @@ float instrObj "lowPrice")
-          ~session_v:Option.(value_map (int64 instrObj "volume") ~default:Float.max_finite_value ~f:Int64.to_float)
-          ~open_interest:Option.(value_map (int64 instrObj "openInterest") ~default:0xffffffffl ~f:Int64.to_int32_exn)
-          ?bid:bidPrice
-          ?bid_qty:Option.(map bidSize ~f:Float.of_int)
-          ?ask:askPrice
-          ?ask_qty:Option.(map askSize ~f:Float.of_int)
-          ~last_trade_p:last_trade_price
-          ~last_trade_v:(Int.to_float last_trade_size)
-          ~last_trade_ts
-          ~bid_ask_ts:last_quote_ts
-          ()
-    in
-    if !my_exchange <> exchange && not Instrument.(is_index symbol) then
-      reject "No such symbol %s-%s" symbol exchange
-    else begin match String.Table.find instruments symbol with
-      | None -> reject "No such symbol %s-%s" symbol exchange
-      | Some instr -> try
-          let snap = snap_of_instr instr in
-          let snap_cs = Cstruct.of_bigarray scratchbuf ~off:0 ~len:Snapshot.sizeof_cs in
-          Snapshot.to_cstruct snap_cs snap;
-          Log.debug log_dtc "-> [%s] %s" addr_str (Snapshot.show snap);
-          Writer.write_cstruct w snap_cs
-        with
-        | Not_found ->
-          Log.error log_dtc "market data request: no quote found for %s" symbol;
-          reject "No market data for symbol %s-%s" symbol exchange;
-        | exn ->
-          Log.error log_dtc "%s" Exn.(to_string exn);
-          reject "No market data for symbol %s-%s" symbol exchange;
-    end
+(*   | Some Heartbeat -> *)
+(*     Option.iter client ~f:begin fun { addr_str } -> *)
+(*       Log.debug log_dtc "<- [%s] HB" addr_str *)
+(*     end *)
 
-  | Some MarketDepthRequest ->
-    let open MarketDepth in
-    let { Request.action; symbol_id; symbol; exchange; nb_levels } = Request.read msg_cs in
-    let { addr_str; subs_depth; _ } = Option.value_exn client in
-    Log.debug log_dtc "<- [%s] MarketDepthReq %s-%s %d" addr_str symbol exchange nb_levels;
-    let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in
-    let reject k = Printf.ksprintf begin fun msg ->
-        Reject.write r_cs ~symbol_id "%s" msg;
-        Log.debug log_dtc "-> [%s] MarketDepthRej: %s" addr_str msg;
-        Writer.write_cstruct w r_cs
-      end k
-    in
-    let accept { bids; asks } =
-      if action = Unsubscribe then String.Table.remove subs_depth symbol;
-      if action = Subscribe then String.Table.set subs_depth symbol symbol_id;
-      let snap_cs = Cstruct.of_bigarray scratchbuf ~off:0 ~len:Snapshot.sizeof_cs in
-      let bids = mapify_ob bids in
-      let asks = mapify_ob asks in
-      if Float.Map.(is_empty bids && is_empty asks) then begin
-        Snapshot.write snap_cs ~symbol_id ~p:0. ~v:0. ~lvl:0 ~first:true ~last:true;
-        Writer.write_cstruct w snap_cs
-      end
-      else begin
-        Float.Map.fold_right bids ~init:1 ~f:begin fun ~key:price ~data:size lvl ->
-          Snapshot.write snap_cs
-            ~symbol_id
-            ~side:`Buy ~p:price ~v:Float.(of_int size) ~lvl
-            ~first:(lvl = 1) ~last:false;
-          Writer.write_cstruct w snap_cs;
-          succ lvl
-        end |> ignore;
-        Float.Map.fold asks ~init:1 ~f:begin fun ~key:price ~data:size lvl ->
-          Snapshot.write snap_cs
-            ~symbol_id
-            ~side:`Sell ~p:price ~v:Float.(of_int size) ~lvl
-            ~first:(lvl = 1 && Float.Map.is_empty bids) ~last:false;
-          Writer.write_cstruct w snap_cs;
-          succ lvl
-        end |> ignore;
-        Snapshot.write snap_cs ~symbol_id ~p:0. ~v:0. ~lvl:0 ~first:false ~last:true;
-        Writer.write_cstruct w snap_cs
-      end
-    in
-    if Instrument.is_index symbol then
-      reject "%s is an index" symbol
-    else if !my_exchange <> exchange then
-      reject "No such symbol %s-%s" symbol exchange
-    else if action <> Unsubscribe && not @@ String.Table.mem instruments symbol then
-      reject "No such symbol %s-%s" symbol exchange
-    else begin match String.Table.find orderbooks symbol with
-      | None ->
-        Log.error log_dtc "MarketDepthReq: found no orderbooks for %s" symbol;
-        reject "Found no orderbook for symbol %s-%s" symbol exchange
-      | Some obs ->
-        accept obs
-    end
+(*   | Some SecurityDefinitionForSymbolRequest -> *)
+(*     let open SecurityDefinition in *)
+(*     let { Request.id; symbol; exchange } = Request.read msg_cs in *)
+(*     let { addr_str; _ } = Option.value_exn client in *)
+(*     Log.debug log_dtc "<- [%s] SeqDefReq %s-%s" addr_str symbol exchange; *)
+(*     let reject_cs = Cstruct.of_bigarray scratchbuf ~len:Reject.sizeof_cs in *)
+(*     let reject k = Printf.ksprintf begin fun msg -> *)
+(*         Reject.write reject_cs ~request_id:id "%s" msg; *)
+(*         Log.debug log_dtc "-> [%s] SeqDefRej" addr_str; *)
+(*         Writer.write_cstruct w reject_cs *)
+(*       end k *)
+(*     in *)
+(*     if !my_exchange <> exchange && not Instrument.(is_index symbol) then *)
+(*       reject "No such symbol %s-%s" symbol exchange *)
+(*     else begin match String.Table.find instruments symbol with *)
+(*     | None -> reject "No such symbol %s-%s" symbol exchange *)
+(*     | Some { secdef } -> *)
+(*       let open Response in *)
+(*       let secdef = { secdef with request_id = id; final = true } in *)
+(*       Log.debug log_dtc "-> [%s] %s" addr_str (show secdef); *)
+(*       let secdef_resp_cs = Cstruct.of_bigarray scratchbuf ~len:sizeof_cs in *)
+(*       Response.to_cstruct secdef_resp_cs secdef; *)
+(*       Writer.write_cstruct w secdef_resp_cs *)
+(*     end *)
 
-  | Some HistoricalPriceDataRequest ->
-    let open HistoricalPriceData in
-    let m = Request.read msg_cs in
-    let { addr_str; _ } = Option.value_exn client in
-    Log.debug log_dtc "<- [%s] HistPriceDataReq %s-%s" addr_str m.symbol m.exchange;
-    let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in
-    let reject k = Printf.ksprintf begin fun reason ->
-        Reject.write r_cs ~request_id:m.request_id "%s" reason;
-        Log.debug log_dtc "-> [%s] HistPriceDataRej" addr_str;
-        Writer.write_cstruct w r_cs;
-      end k
-    in
-    let accept () =
-      match String.Table.find instruments m.Request.symbol with
-       | None ->
-         reject "No such symbol %s-%s" m.symbol m.exchange;
-         Deferred.unit
-       | Some _ ->
-         let f addr te_r te_w =
-           Writer.write_cstruct te_w msg_cs;
-           let r_pipe = Reader.pipe te_r in
-           let w_pipe = Writer.pipe w in
-           Pipe.transfer_id r_pipe w_pipe >>| fun () ->
-           Log.debug log_dtc "-> [%s] <historical data>" addr_str
-         in
-         Monitor.try_with_or_error
-           ~name:"historical_with_connection"
-           (fun () -> Tcp.(with_connection (to_file !bitmex_historical) f)) >>| function
-         | Error err -> reject "Historical data server unavailable"
-         | Ok () -> ()
-    in
-    if !my_exchange <> m.exchange && not Instrument.(is_index m.symbol) then
-      reject "No such symbol %s-%s" m.symbol m.exchange
-    else don't_wait_for @@ accept ()
+(*   | Some MarketDataRequest -> *)
+(*     let open MarketData in *)
+(*     let { Request.action; symbol_id; symbol; exchange } = Request.read msg_cs in *)
+(*     Log.debug log_dtc "<- [%s] MarketDataReq %s %s-%s" addr_str (RequestAction.show action) symbol exchange; *)
+(*     let { addr_str; subs; _ } = Option.value_exn client in *)
+(*     let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in *)
+(*     let reject k = Printf.ksprintf begin fun reason -> *)
+(*         Reject.write r_cs ~symbol_id "%s" reason; *)
+(*         Log.debug log_dtc "-> [%s] Market Data Reject: %s" addr_str reason; *)
+(*         Writer.write_cstruct w r_cs *)
+(*       end k *)
+(*     in *)
+(*     let snap_of_instr { instrObj; last_trade_price; last_trade_size; last_trade_ts; last_quote_ts } = *)
+(*       if action = Unsubscribe then String.Table.remove subs symbol; *)
+(*       if action = Subscribe then String.Table.set subs symbol symbol_id; *)
+(*       if Instrument.is_index symbol then *)
+(*         Snapshot.create *)
+(*           ~symbol_id:symbol_id *)
+(*           ?session_settlement_price:(RespObj.float instrObj "prevPrice24h") *)
+(*           ?last_trade_p:(RespObj.float instrObj "lastPrice") *)
+(*           ?last_trade_ts:(RespObj.string instrObj "timestamp" |> Option.map ~f:Time_ns.of_string) *)
+(*           () *)
+(*       else *)
+(*         (\* let open RespObj in *\) *)
+(*         let { Quote.bidPrice; bidSize; askPrice; askSize } = String.Table.find_exn quotes symbol in *)
+(*         let open RespObj in *)
+(*         Snapshot.create *)
+(*           ~symbol_id *)
+(*           ~session_settlement_price:Option.(value ~default:Float.max_finite_value (float instrObj "indicativeSettlePrice")) *)
+(*           ~session_h:Option.(value ~default:Float.max_finite_value @@ float instrObj "highPrice") *)
+(*           ~session_l:Option.(value ~default:Float.max_finite_value @@ float instrObj "lowPrice") *)
+(*           ~session_v:Option.(value_map (int64 instrObj "volume") ~default:Float.max_finite_value ~f:Int64.to_float) *)
+(*           ~open_interest:Option.(value_map (int64 instrObj "openInterest") ~default:0xffffffffl ~f:Int64.to_int32_exn) *)
+(*           ?bid:bidPrice *)
+(*           ?bid_qty:Option.(map bidSize ~f:Float.of_int) *)
+(*           ?ask:askPrice *)
+(*           ?ask_qty:Option.(map askSize ~f:Float.of_int) *)
+(*           ~last_trade_p:last_trade_price *)
+(*           ~last_trade_v:(Int.to_float last_trade_size) *)
+(*           ~last_trade_ts *)
+(*           ~bid_ask_ts:last_quote_ts *)
+(*           () *)
+(*     in *)
+(*     if !my_exchange <> exchange && not Instrument.(is_index symbol) then *)
+(*       reject "No such symbol %s-%s" symbol exchange *)
+(*     else begin match String.Table.find instruments symbol with *)
+(*       | None -> reject "No such symbol %s-%s" symbol exchange *)
+(*       | Some instr -> try *)
+(*           let snap = snap_of_instr instr in *)
+(*           let snap_cs = Cstruct.of_bigarray scratchbuf ~off:0 ~len:Snapshot.sizeof_cs in *)
+(*           Snapshot.to_cstruct snap_cs snap; *)
+(*           Log.debug log_dtc "-> [%s] %s" addr_str (Snapshot.show snap); *)
+(*           Writer.write_cstruct w snap_cs *)
+(*         with *)
+(*         | Not_found -> *)
+(*           Log.error log_dtc "market data request: no quote found for %s" symbol; *)
+(*           reject "No market data for symbol %s-%s" symbol exchange; *)
+(*         | exn -> *)
+(*           Log.error log_dtc "%s" Exn.(to_string exn); *)
+(*           reject "No market data for symbol %s-%s" symbol exchange; *)
+(*     end *)
 
-  | Some OpenOrdersRequest ->
-    let open Trading.Order.Open in
-    let m = Request.read msg_cs in
-    let { addr_str; order; _ } = Option.value_exn client in
-    Log.debug log_dtc "<- [%s] %s" addr_str (Request.show m);
-    let nb_open_orders, open_orders = Uuid.Table.fold order
-        ~init:(0, [])
-        ~f:begin fun ~key:_ ~data ((nb_open_orders, os) as acc) ->
-          match RespObj.(string_exn data "ordStatus") with
-          | "New" | "PartiallyFilled" | "PendingCancel" ->
-            (succ nb_open_orders, data :: os)
-          | _ -> acc
-        end
-    in
-    let open Trading.Order.Update in
-    let update_cs = Cstruct.of_bigarray ~off:0 ~len:sizeof_cs scratchbuf in
-    let send_order_update i data =
-      let ord_type = ord_type_of_string RespObj.(string_exn data "ordType") in
-      let price = RespObj.(float_or_null_exn ~default:Float.max_finite_value data "price") in
-      let stopPx = RespObj.(float_or_null_exn ~default:Float.max_finite_value data "stopPx") in
-      let p1, p2 = p1_p2_of_bitmex ~ord_type ~stopPx ~price in
-      write
-        ~nb_msgs:nb_open_orders
-        ~msg_number:(succ i)
-        ~status:`Open (* FIXME: PartiallyFilled ?? *)
-        ~reason:UpdateReason.Open_orders_request_response
-        ~request_id:m.Request.id
-        ~symbol:RespObj.(string_exn data "symbol")
-        ~exchange:!my_exchange
-        ~cli_ord_id:RespObj.(string_exn data "clOrdID")
-        ~srv_ord_id:RespObj.(string_exn data "orderID" |> b64_of_uuid)
-        ~xch_ord_id:RespObj.(string_exn data "orderID" |> b64_of_uuid)
-        ~ord_type:(ord_type_of_string RespObj.(string_exn data "ordType"))
-        ?side:(RespObj.string_exn data "side" |> side_of_bmex)
-        ?p1
-        ?p2
-        ~order_qty:RespObj.(int64_exn data "orderQty" |> Int64.to_float)
-        ~filled_qty:RespObj.(int64_exn data "cumQty" |> Int64.to_float)
-        ~remaining_qty:RespObj.(int64_exn data "leavesQty" |> Int64.to_float)
-        ~tif:(tif_of_string RespObj.(string_exn data "timeInForce"))
-        ~trade_account:RespObj.(int64_exn data "account" |> Int64.to_string)
-        ~free_form_text:RespObj.(string_exn data "text")
-        update_cs;
-      Writer.write_cstruct w update_cs;
-    in
-    List.iteri open_orders ~f:send_order_update;
-    if nb_open_orders = 0 then begin
-      write ~nb_msgs:1 ~msg_number:1 ~request_id:m.Request.id
-        ~reason:UpdateReason.Open_orders_request_response ~no_orders:true update_cs;
-      Writer.write_cstruct w update_cs
-    end;
-    Log.debug log_dtc "-> [%s] %d orders" addr_str nb_open_orders;
+(*   | Some MarketDepthRequest -> *)
+(*     let open MarketDepth in *)
+(*     let { Request.action; symbol_id; symbol; exchange; nb_levels } = Request.read msg_cs in *)
+(*     let { addr_str; subs_depth; _ } = Option.value_exn client in *)
+(*     Log.debug log_dtc "<- [%s] MarketDepthReq %s-%s %d" addr_str symbol exchange nb_levels; *)
+(*     let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in *)
+(*     let reject k = Printf.ksprintf begin fun msg -> *)
+(*         Reject.write r_cs ~symbol_id "%s" msg; *)
+(*         Log.debug log_dtc "-> [%s] MarketDepthRej: %s" addr_str msg; *)
+(*         Writer.write_cstruct w r_cs *)
+(*       end k *)
+(*     in *)
+(*     let accept { bids; asks } = *)
+(*       if action = Unsubscribe then String.Table.remove subs_depth symbol; *)
+(*       if action = Subscribe then String.Table.set subs_depth symbol symbol_id; *)
+(*       let snap_cs = Cstruct.of_bigarray scratchbuf ~off:0 ~len:Snapshot.sizeof_cs in *)
+(*       let bids = mapify_ob bids in *)
+(*       let asks = mapify_ob asks in *)
+(*       if Float.Map.(is_empty bids && is_empty asks) then begin *)
+(*         Snapshot.write snap_cs ~symbol_id ~p:0. ~v:0. ~lvl:0 ~first:true ~last:true; *)
+(*         Writer.write_cstruct w snap_cs *)
+(*       end *)
+(*       else begin *)
+(*         Float.Map.fold_right bids ~init:1 ~f:begin fun ~key:price ~data:size lvl -> *)
+(*           Snapshot.write snap_cs *)
+(*             ~symbol_id *)
+(*             ~side:`Buy ~p:price ~v:Float.(of_int size) ~lvl *)
+(*             ~first:(lvl = 1) ~last:false; *)
+(*           Writer.write_cstruct w snap_cs; *)
+(*           succ lvl *)
+(*         end |> ignore; *)
+(*         Float.Map.fold asks ~init:1 ~f:begin fun ~key:price ~data:size lvl -> *)
+(*           Snapshot.write snap_cs *)
+(*             ~symbol_id *)
+(*             ~side:`Sell ~p:price ~v:Float.(of_int size) ~lvl *)
+(*             ~first:(lvl = 1 && Float.Map.is_empty bids) ~last:false; *)
+(*           Writer.write_cstruct w snap_cs; *)
+(*           succ lvl *)
+(*         end |> ignore; *)
+(*         Snapshot.write snap_cs ~symbol_id ~p:0. ~v:0. ~lvl:0 ~first:false ~last:true; *)
+(*         Writer.write_cstruct w snap_cs *)
+(*       end *)
+(*     in *)
+(*     if Instrument.is_index symbol then *)
+(*       reject "%s is an index" symbol *)
+(*     else if !my_exchange <> exchange then *)
+(*       reject "No such symbol %s-%s" symbol exchange *)
+(*     else if action <> Unsubscribe && not @@ String.Table.mem instruments symbol then *)
+(*       reject "No such symbol %s-%s" symbol exchange *)
+(*     else begin match String.Table.find orderbooks symbol with *)
+(*       | None -> *)
+(*         Log.error log_dtc "MarketDepthReq: found no orderbooks for %s" symbol; *)
+(*         reject "Found no orderbook for symbol %s-%s" symbol exchange *)
+(*       | Some obs -> *)
+(*         accept obs *)
+(*     end *)
 
-  | Some CurrentPositionsRequest ->
-    let open Trading.Position in
-    let m = Request.read msg_cs in
-    let update_cs = Cstruct.of_bigarray ~off:0 ~len:Update.sizeof_cs scratchbuf in
-    let { addr_str; position; _ } = Option.value_exn client in
-    Log.debug log_dtc "<- [%s] PosReq (%s)" addr_str m.Request.trade_account;
-    let nb_open_positions, open_positions = IS.Table.fold position
-        ~init:(0, [])
-        ~f:begin fun ~key:_ ~data ((nb_open_ps, open_ps) as acc) ->
-          if RespObj.bool_exn data "isOpen" then
-            succ nb_open_ps, data :: open_ps
-          else
-            acc
-        end
-    in
-    List.iteri open_positions ~f:begin fun i ->
-      write_position_update ~request_id:m.id ~nb_msgs:nb_open_positions ~msg_number:(succ i) w update_cs
-    end;
-    if nb_open_positions = 0 then begin
-      Update.write ~nb_msgs:1 ~msg_number:1 ~request_id:m.Request.id ~no_positions:true update_cs;
-      Writer.write_cstruct w update_cs
-    end;
-    Log.debug log_dtc "-> [%s] %d positions" addr_str nb_open_positions;
+(*   | Some HistoricalPriceDataRequest -> *)
+(*     let open HistoricalPriceData in *)
+(*     let m = Request.read msg_cs in *)
+(*     let { addr_str; _ } = Option.value_exn client in *)
+(*     Log.debug log_dtc "<- [%s] HistPriceDataReq %s-%s" addr_str m.symbol m.exchange; *)
+(*     let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in *)
+(*     let reject k = Printf.ksprintf begin fun reason -> *)
+(*         Reject.write r_cs ~request_id:m.request_id "%s" reason; *)
+(*         Log.debug log_dtc "-> [%s] HistPriceDataRej" addr_str; *)
+(*         Writer.write_cstruct w r_cs; *)
+(*       end k *)
+(*     in *)
+(*     let accept () = *)
+(*       match String.Table.find instruments m.Request.symbol with *)
+(*        | None -> *)
+(*          reject "No such symbol %s-%s" m.symbol m.exchange; *)
+(*          Deferred.unit *)
+(*        | Some _ -> *)
+(*          let f addr te_r te_w = *)
+(*            Writer.write_cstruct te_w msg_cs; *)
+(*            let r_pipe = Reader.pipe te_r in *)
+(*            let w_pipe = Writer.pipe w in *)
+(*            Pipe.transfer_id r_pipe w_pipe >>| fun () -> *)
+(*            Log.debug log_dtc "-> [%s] <historical data>" addr_str *)
+(*          in *)
+(*          Monitor.try_with_or_error *)
+(*            ~name:"historical_with_connection" *)
+(*            (fun () -> Tcp.(with_connection (to_file !bitmex_historical) f)) >>| function *)
+(*          | Error err -> reject "Historical data server unavailable" *)
+(*          | Ok () -> () *)
+(*     in *)
+(*     if !my_exchange <> m.exchange && not Instrument.(is_index m.symbol) then *)
+(*       reject "No such symbol %s-%s" m.symbol m.exchange *)
+(*     else don't_wait_for @@ accept () *)
 
-  | Some HistoricalOrderFillsRequest ->
-    let open Trading.Order.Fills in
-    let m = Request.read msg_cs in
-    let response_cs = Cstruct.of_bigarray scratchbuf ~len:Response.sizeof_cs in
-    let { addr_str; key; secret; _ } = Option.value_exn client in
-    Log.debug log_dtc "<- [%s] HistFillsReq" addr_str;
-    let uri = Uri.with_path !base_uri "/api/v1/execution/tradeHistory" in
-    let req = List.filter_opt [
-        if m.Request.srv_order_id <> "" then Some ("orderID", `String m.Request.srv_order_id) else None;
-        Some ("execType", `String "Trade")
-      ]
-    in
-    let uri = Uri.with_query' uri ["filter", Yojson.Safe.to_string @@ `Assoc req] in
-    let process_body = function
-    | `List orders ->
-      let nb_msgs = List.length orders in
-      List.iteri orders ~f:begin fun i o ->
-        let o = RespObj.of_json o in
-        Response.write
-          ~nb_msgs
-          ~msg_number:(succ i)
-          ~request_id:m.Request.id
-          ~symbol:RespObj.(string_exn o "symbol")
-          ~exchange:!my_exchange
-          ~srv_order_id:RespObj.(string_exn o "orderID" |> b64_of_uuid)
-          ~p:RespObj.(float_exn o "avgPx")
-          ~v:Float.(of_int64 RespObj.(int64_exn o "orderQty"))
-          ?ts:(RespObj.string o "transactTime" |> Option.map ~f:Time_ns.of_string)
-          ?side:(RespObj.string_exn o "side" |> side_of_bmex)
-          ~exec_id:RespObj.(string_exn o "execID" |> b64_of_uuid)
-          response_cs;
-        Writer.write_cstruct w response_cs
-      end;
-      Log.debug log_dtc "-> [%s] HistOrdFillsResp %d" addr_str nb_msgs
-    | #Yojson.Safe.json -> invalid_arg "bitmex historical order fills response"
-    in
-    let get_fills_and_reply () =
-      Rest.call ~name:"execution" ~f:begin fun uri ->
-        Client.get ~headers:(Rest.mk_headers ~key ~secret `GET uri) uri
-      end uri >>| function
-      | Ok body -> process_body body
-      | Error err ->
-        (* TODO: reject on error *)
-        Log.error log_bitmex "%s" @@ Error.to_string_hum err
-    in don't_wait_for @@ get_fills_and_reply () (* TODO: reject on error *)
+(*   | Some OpenOrdersRequest -> *)
+(*     let open Trading.Order.Open in *)
+(*     let m = Request.read msg_cs in *)
+(*     let { addr_str; order; _ } = Option.value_exn client in *)
+(*     Log.debug log_dtc "<- [%s] %s" addr_str (Request.show m); *)
+(*     let nb_open_orders, open_orders = Uuid.Table.fold order *)
+(*         ~init:(0, []) *)
+(*         ~f:begin fun ~key:_ ~data ((nb_open_orders, os) as acc) -> *)
+(*           match RespObj.(string_exn data "ordStatus") with *)
+(*           | "New" | "PartiallyFilled" | "PendingCancel" -> *)
+(*             (succ nb_open_orders, data :: os) *)
+(*           | _ -> acc *)
+(*         end *)
+(*     in *)
+(*     let open Trading.Order.Update in *)
+(*     let update_cs = Cstruct.of_bigarray ~off:0 ~len:sizeof_cs scratchbuf in *)
+(*     let send_order_update i data = *)
+(*       let ord_type = ord_type_of_string RespObj.(string_exn data "ordType") in *)
+(*       let price = RespObj.(float_or_null_exn ~default:Float.max_finite_value data "price") in *)
+(*       let stopPx = RespObj.(float_or_null_exn ~default:Float.max_finite_value data "stopPx") in *)
+(*       let p1, p2 = p1_p2_of_bitmex ~ord_type ~stopPx ~price in *)
+(*       write *)
+(*         ~nb_msgs:nb_open_orders *)
+(*         ~msg_number:(succ i) *)
+(*         ~status:`Open (\* FIXME: PartiallyFilled ?? *\) *)
+(*         ~reason:UpdateReason.Open_orders_request_response *)
+(*         ~request_id:m.Request.id *)
+(*         ~symbol:RespObj.(string_exn data "symbol") *)
+(*         ~exchange:!my_exchange *)
+(*         ~cli_ord_id:RespObj.(string_exn data "clOrdID") *)
+(*         ~srv_ord_id:RespObj.(string_exn data "orderID" |> b64_of_uuid) *)
+(*         ~xch_ord_id:RespObj.(string_exn data "orderID" |> b64_of_uuid) *)
+(*         ~ord_type:(ord_type_of_string RespObj.(string_exn data "ordType")) *)
+(*         ?side:(RespObj.string_exn data "side" |> side_of_bmex) *)
+(*         ?p1 *)
+(*         ?p2 *)
+(*         ~order_qty:RespObj.(int64_exn data "orderQty" |> Int64.to_float) *)
+(*         ~filled_qty:RespObj.(int64_exn data "cumQty" |> Int64.to_float) *)
+(*         ~remaining_qty:RespObj.(int64_exn data "leavesQty" |> Int64.to_float) *)
+(*         ~tif:(tif_of_string RespObj.(string_exn data "timeInForce")) *)
+(*         ~trade_account:RespObj.(int64_exn data "account" |> Int64.to_string) *)
+(*         ~free_form_text:RespObj.(string_exn data "text") *)
+(*         update_cs; *)
+(*       Writer.write_cstruct w update_cs; *)
+(*     in *)
+(*     List.iteri open_orders ~f:send_order_update; *)
+(*     if nb_open_orders = 0 then begin *)
+(*       write ~nb_msgs:1 ~msg_number:1 ~request_id:m.Request.id *)
+(*         ~reason:UpdateReason.Open_orders_request_response ~no_orders:true update_cs; *)
+(*       Writer.write_cstruct w update_cs *)
+(*     end; *)
+(*     Log.debug log_dtc "-> [%s] %d orders" addr_str nb_open_orders; *)
 
-  | Some TradeAccountsRequest ->
-    let open Account.List in
-    let m = Request.read msg_cs in
-    let { addr_str; margin; _ } = Option.value_exn client in
-    Log.debug log_dtc "<- [%s] TradeAccountsReq" addr_str;
-    let response_cs =
-      Cstruct.of_bigarray ~off:0 ~len:Response.sizeof_cs scratchbuf in
-    let account, _ = List.hd_exn @@ IS.Table.keys margin in
-    Response.write ~request_id:m.Request.id ~msg_number:1 ~nb_msgs:1
-      ~trade_account:Int.(to_string account) response_cs;
-    Writer.write_cstruct w response_cs;
-    Log.debug log_dtc "-> [%s] TradeAccountResp %d" addr_str account
+(*   | Some CurrentPositionsRequest -> *)
+(*     let open Trading.Position in *)
+(*     let m = Request.read msg_cs in *)
+(*     let update_cs = Cstruct.of_bigarray ~off:0 ~len:Update.sizeof_cs scratchbuf in *)
+(*     let { addr_str; position; _ } = Option.value_exn client in *)
+(*     Log.debug log_dtc "<- [%s] PosReq (%s)" addr_str m.Request.trade_account; *)
+(*     let nb_open_positions, open_positions = IS.Table.fold position *)
+(*         ~init:(0, []) *)
+(*         ~f:begin fun ~key:_ ~data ((nb_open_ps, open_ps) as acc) -> *)
+(*           if RespObj.bool_exn data "isOpen" then *)
+(*             succ nb_open_ps, data :: open_ps *)
+(*           else *)
+(*             acc *)
+(*         end *)
+(*     in *)
+(*     List.iteri open_positions ~f:begin fun i -> *)
+(*       write_position_update ~request_id:m.id ~nb_msgs:nb_open_positions ~msg_number:(succ i) w update_cs *)
+(*     end; *)
+(*     if nb_open_positions = 0 then begin *)
+(*       Update.write ~nb_msgs:1 ~msg_number:1 ~request_id:m.Request.id ~no_positions:true update_cs; *)
+(*       Writer.write_cstruct w update_cs *)
+(*     end; *)
+(*     Log.debug log_dtc "-> [%s] %d positions" addr_str nb_open_positions; *)
 
-  | Some AccountBalanceRequest ->
-    let open Account.Balance in
-    let m = Request.read msg_cs in
-    let { addr_str; margin; _ } = Option.value_exn client in
-    let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in
-    let update_cs = Cstruct.of_bigarray ~off:0 ~len:Update.sizeof_cs scratchbuf in
-    let reject k = Printf.ksprintf begin fun reason ->
-        Reject.write r_cs ~request_id:m.id "%s" reason;
-        Writer.write_cstruct w r_cs;
-        Log.debug log_dtc "-> [%s] AccountBalanceRej" addr_str;
-      end k
-    in
-    let write_no_balances request_id =
-      Account.Balance.Update.write ~request_id ~nb_msgs:1 ~msg_number:1 ~no_account_balance:true update_cs;
-      Writer.write_cstruct w update_cs;
-      Log.debug log_dtc "-> [%s] no account balance" addr_str
-    in
-    let update ~msg_number ~nb_msgs account_id obj =
-      write_balance_update ~unsolicited:false ~msg_number ~nb_msgs update_cs obj;
-      Writer.write_cstruct w update_cs;
-      Log.debug log_dtc "-> [%s] account balance %d" addr_str account_id
-    in
-    Log.debug log_dtc "<- [%s] AccountBalanceReq (%s)"
-      addr_str m.Request.trade_account;
-    let nb_msgs = IS.Table.length margin in
-    if nb_msgs = 0 then
-      write_no_balances m.id
-    else if m.Request.trade_account = "" then
-      ignore @@ IS.Table.fold margin ~init:1
-        ~f:(fun ~key:(account_id, currency) ~data msg_number ->
-            update ~msg_number ~nb_msgs account_id data;
-            succ msg_number
-          )
-    else begin
-      match IS.Table.find margin (Int.of_string m.Request.trade_account, "XBt")
-      with
-      | Some obj -> update ~msg_number:1 ~nb_msgs:1 Int.(of_string m.Request.trade_account) obj
-      | None -> write_no_balances m.id
-      | exception _ -> reject "Invalid trade account %s" m.Request.trade_account
-    end
+(*   | Some HistoricalOrderFillsRequest -> *)
+(*     let open Trading.Order.Fills in *)
+(*     let m = Request.read msg_cs in *)
+(*     let response_cs = Cstruct.of_bigarray scratchbuf ~len:Response.sizeof_cs in *)
+(*     let { addr_str; key; secret; _ } = Option.value_exn client in *)
+(*     Log.debug log_dtc "<- [%s] HistFillsReq" addr_str; *)
+(*     let uri = Uri.with_path !base_uri "/api/v1/execution/tradeHistory" in *)
+(*     let req = List.filter_opt [ *)
+(*         if m.Request.srv_order_id <> "" then Some ("orderID", `String m.Request.srv_order_id) else None; *)
+(*         Some ("execType", `String "Trade") *)
+(*       ] *)
+(*     in *)
+(*     let uri = Uri.with_query' uri ["filter", Yojson.Safe.to_string @@ `Assoc req] in *)
+(*     let process_body = function *)
+(*     | `List orders -> *)
+(*       let nb_msgs = List.length orders in *)
+(*       List.iteri orders ~f:begin fun i o -> *)
+(*         let o = RespObj.of_json o in *)
+(*         Response.write *)
+(*           ~nb_msgs *)
+(*           ~msg_number:(succ i) *)
+(*           ~request_id:m.Request.id *)
+(*           ~symbol:RespObj.(string_exn o "symbol") *)
+(*           ~exchange:!my_exchange *)
+(*           ~srv_order_id:RespObj.(string_exn o "orderID" |> b64_of_uuid) *)
+(*           ~p:RespObj.(float_exn o "avgPx") *)
+(*           ~v:Float.(of_int64 RespObj.(int64_exn o "orderQty")) *)
+(*           ?ts:(RespObj.string o "transactTime" |> Option.map ~f:Time_ns.of_string) *)
+(*           ?side:(RespObj.string_exn o "side" |> side_of_bmex) *)
+(*           ~exec_id:RespObj.(string_exn o "execID" |> b64_of_uuid) *)
+(*           response_cs; *)
+(*         Writer.write_cstruct w response_cs *)
+(*       end; *)
+(*       Log.debug log_dtc "-> [%s] HistOrdFillsResp %d" addr_str nb_msgs *)
+(*     | #Yojson.Safe.json -> invalid_arg "bitmex historical order fills response" *)
+(*     in *)
+(*     let get_fills_and_reply () = *)
+(*       Rest.call ~name:"execution" ~f:begin fun uri -> *)
+(*         Client.get ~headers:(Rest.mk_headers ~key ~secret `GET uri) uri *)
+(*       end uri >>| function *)
+(*       | Ok body -> process_body body *)
+(*       | Error err -> *)
+(*         (\* TODO: reject on error *\) *)
+(*         Log.error log_bitmex "%s" @@ Error.to_string_hum err *)
+(*     in don't_wait_for @@ get_fills_and_reply () (\* TODO: reject on error *\) *)
 
-  | Some SubmitNewSingleOrder ->
-    let module S = Trading.Order.Submit in
-    let module U = Trading.Order.Update in
-    let m = S.read msg_cs in
-    let { addr_str; key; secret; current_parent; stop_exec_inst } as c = Option.value_exn client in
-    let order_update_cs = Cstruct.of_bigarray ~off:0 ~len:U.sizeof_cs scratchbuf in
-    Log.debug log_dtc "<- [%s] %s" addr_str (S.show m);
-    let accept_exn () =
-      let uri = Uri.with_path !base_uri "/api/v1/order" in
-      let qty = match Option.value_exn ~message:"side is undefined" m.S.side with
-        | `Buy -> m.S.qty
-        | `Sell -> Float.neg m.S.qty
-      in
-      let tif = Option.value_exn ~message:"tif is undefined" m.tif in
-      let ordType = Option.value_exn ~message:"ordType is undefined" m.ord_type in
-      let tif = match tif with
-      | `Good_till_date_time -> invalid_arg "good_till_date_time"
-      | #time_in_force as tif -> tif in
-      let body =
-        ["symbol", `String m.S.symbol;
-         "orderQty", `Float qty;
-         "timeInForce", `String (string_of_tif tif);
-         "ordType", `String (string_of_ord_type ordType);
-         "clOrdID", `String m.S.cli_ord_id;
-         "text", `String m.text;
-        ]
-        @ price_fields_of_dtc ordType ~p1:m.S.p1 ~p2:m.S.p2
-        @ execInst_of_dtc ordType tif stop_exec_inst
-      in
-      let body_str = Yojson.Safe.to_string @@ `Assoc body in
-      let body = Body.of_string body_str in
-      Log.debug log_bitmex "-> %s" body_str;
-      Rest.call ~name:"submit" ~f:begin fun uri ->
-        Client.post ~chunked:false ~body
-          ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `POST uri) uri
-      end uri >>| function
-      | Ok _body -> ()
-      | Error err ->
-        let err_str = Error.to_string_hum err in
-        Dtc_util.Trading.Order.Submit.reject order_update_cs m "%s" err_str;
-        Writer.write_cstruct w order_update_cs;
-        Log.error log_bitmex "%s" err_str
-    in
-    if !my_exchange <> m.S.exchange then begin
-      Dtc_util.Trading.Order.Submit.reject order_update_cs m "Unknown exchange";
-      Writer.write_cstruct w order_update_cs;
-    end
-    else if m.S.tif = Some `Good_till_date_time then begin
-      Dtc_util.Trading.Order.Submit.reject order_update_cs m "BitMEX does not support TIF Good till datetime";
-      Writer.write_cstruct w order_update_cs;
-    end
-    else if Option.is_some current_parent then begin
-      c.current_parent <- None;
-      Dtc_util.Trading.Order.Submit.reject order_update_cs Option.(value_exn current_parent) "Next received order was not an OCO";
-      Writer.write_cstruct w order_update_cs;
-      Dtc_util.Trading.Order.Submit.reject order_update_cs m "Previous received order was also a parent and the current order is not an OCO";
-      Writer.write_cstruct w order_update_cs;
-    end
-    else if m.S.parent then begin
-      set_parent_order c m;
-      Dtc_util.Trading.Order.Submit.update
-        ~status:`Pending_open ~reason:General_order_update
-        order_update_cs m "parent order %s stored" m.S.cli_ord_id;
-      Writer.write_cstruct w order_update_cs;
-      Log.debug log_dtc "Stored parent order %s" m.S.cli_ord_id
-    end
-    else
-      let on_exn _ =
-        Dtc_util.Trading.Order.Submit.update
-          ~status:`Rejected ~reason:New_order_rejected
-          order_update_cs m
-          "exception raised when trying to submit %s" m.S.cli_ord_id;
-        Writer.write_cstruct w order_update_cs;
-        Deferred.unit
-      in
-      don't_wait_for @@ eat_exn ~on_exn accept_exn
+(*   | Some TradeAccountsRequest -> *)
+(*     let open Account.List in *)
+(*     let m = Request.read msg_cs in *)
+(*     let { addr_str; margin; _ } = Option.value_exn client in *)
+(*     Log.debug log_dtc "<- [%s] TradeAccountsReq" addr_str; *)
+(*     let response_cs = *)
+(*       Cstruct.of_bigarray ~off:0 ~len:Response.sizeof_cs scratchbuf in *)
+(*     let account, _ = List.hd_exn @@ IS.Table.keys margin in *)
+(*     Response.write ~request_id:m.Request.id ~msg_number:1 ~nb_msgs:1 *)
+(*       ~trade_account:Int.(to_string account) response_cs; *)
+(*     Writer.write_cstruct w response_cs; *)
+(*     Log.debug log_dtc "-> [%s] TradeAccountResp %d" addr_str account *)
 
-  | Some SubmitNewOCOOrder ->
-    let module S = Trading.Order.SubmitOCO in
-    let module S' = Trading.Order.Submit in
-    let module U = Trading.Order.Update in
-    let m = S.read msg_cs in
-    let { addr_str; key; secret; current_parent; parents; stop_exec_inst } as c = Option.value_exn client in
-    let order_update_cs = Cstruct.of_bigarray ~off:0 ~len:U.sizeof_cs scratchbuf in
-    Log.debug log_dtc "<- [%s] %s" addr_str (S.show m);
-    let reject cs m k = Printf.ksprintf begin fun reason ->
-        U.write
-          ~nb_msgs:1
-          ~msg_number:1
-          ~trade_account:m.S.trade_account
-          ~status:`Rejected
-          ~reason:New_order_rejected
-          ~cli_ord_id:m.S.cli_ord_id_1
-          ~symbol:m.S.symbol
-          ~exchange:m.S.exchange
-          ?ord_type:m.S.ord_type_1
-          ?side:m.S.side_1
-          ~p1:m.S.p1_1
-          ~p2:m.S.p2_1
-          ~order_qty:m.S.qty_1
-          ?tif:m.S.tif
-          ~good_till_ts:m.S.good_till_ts
-          ~info_text:reason
-          ~free_form_text:m.text
-          cs;
-        Writer.write_cstruct w cs;
-        Log.debug log_dtc "-> [%s] Reject (%s)" addr_str reason;
-        U.write
-          ~nb_msgs:1
-          ~msg_number:1
-          ~trade_account:m.S.trade_account
-          ~status:`Rejected
-          ~reason:New_order_rejected
-          ~cli_ord_id:m.S.cli_ord_id_2
-          ~symbol:m.S.symbol
-          ~exchange:m.S.exchange
-          ?ord_type:m.S.ord_type_2
-          ?side:m.S.side_2
-          ~p1:m.S.p1_2
-          ~p2:m.S.p2_2
-          ~order_qty:m.S.qty_2
-          ?tif:m.S.tif
-          ~good_till_ts:m.S.good_till_ts
-          ~info_text:reason
-          ~free_form_text:m.text
-          cs;
-        Writer.write_cstruct w cs;
-        Log.debug log_dtc "-> [%s] SubmitOCORej: %s" addr_str reason
-      end k
-    in
-    let accept_exn ?parent m =
-      let uri = Uri.with_path !base_uri "/api/v1/order/bulk" in
-      let qty_1 = match m.S.side_1 with
-        | Some `Buy -> m.S.qty_1
-        | Some `Sell -> Float.neg m.S.qty_1
-        | None -> invalid_arg "side1 is undefined"
-      in
-      let qty_2 = match m.S.side_2 with
-        | Some `Buy -> m.S.qty_2
-        | Some `Sell -> Float.neg m.S.qty_2
-        | None -> invalid_arg "side2 is undefined"
-      in
-      let tif = Option.value_exn ~message:"tif is undefined" m.tif in
-      let tif = match tif with
-      | `Good_till_date_time -> invalid_arg "good_till_date_time"
-      | #time_in_force as tif -> tif in
-      let ordType1 = Option.value_exn ~message:"ordType1 is undefined" m.ord_type_1 in
-      let ordType2 = Option.value_exn ~message:"ordType2 is undefined" m.ord_type_2 in
-      let orders = match parent with
-        | None ->
-          [
-            ["symbol", `String m.S.symbol;
-             "orderQty", `Float qty_1;
-             "timeInForce", `String (string_of_tif tif);
-             "ordType", `String (string_of_ord_type ordType1);
-             "clOrdID", `String m.S.cli_ord_id_1;
-             "contingencyType", `String "OneUpdatesTheOtherAbsolute";
-             "clOrdLinkID", `String m.S.cli_ord_id_1;
-             "text", `String m.text;
-            ]
-            @ price_fields_of_dtc ordType1 ~p1:m.S.p1_1 ~p2:m.S.p2_1
-            @ execInst_of_dtc ordType1 tif stop_exec_inst;
-            ["symbol", `String m.S.symbol;
-             "orderQty", `Float qty_2;
-             "timeInForce", `String (string_of_tif tif);
-             "ordType", `String (string_of_ord_type ordType2);
-             "clOrdID", `String m.S.cli_ord_id_2;
-             "contingencyType", `String "OneUpdatesTheOtherAbsolute";
-             "clOrdLinkID", `String m.S.cli_ord_id_1;
-             "text", `String m.text;
-            ]
-            @ price_fields_of_dtc ordType2 ~p1:m.S.p1_2 ~p2:m.S.p2_2
-            @ execInst_of_dtc ordType2 tif stop_exec_inst;
-          ]
-        | Some p ->
-          let p_qty = match p.S'.side with
-            | Some `Buy -> p.S'.qty
-            | Some `Sell -> Float.neg p.S'.qty
-            | None -> invalid_arg "side is undefined"
-          in
-          let pTif = Option.value_exn ~message:"tif is undefined" p.tif in
-          let pTif = match pTif with
-          | `Good_till_date_time -> invalid_arg "good_till_date_time"
-          | #time_in_force as tif -> tif in
-          let pOrdType = Option.value_exn ~message:"ordType1 is undefined" p.ord_type in
-          [
-            ["symbol", `String p.S'.symbol;
-             "orderQty", `Float p_qty;
-             "timeInForce", `String (string_of_tif pTif);
-             "ordType", `String (string_of_ord_type pOrdType);
-             "clOrdID", `String p.S'.cli_ord_id;
-             "contingencyType", `String "OneTriggersTheOther";
-             "clOrdLinkID", `String p.S'.cli_ord_id;
-             "text", `String p.text;
-            ]
-            @ price_fields_of_dtc pOrdType ~p1:p.S'.p1 ~p2:p.S'.p2
-            @ execInst_of_dtc pOrdType pTif stop_exec_inst;
-            ["symbol", `String m.S.symbol;
-             "orderQty", `Float qty_1;
-             "timeInForce", `String (string_of_tif tif);
-             "ordType", `String (string_of_ord_type ordType1);
-             "clOrdID", `String m.S.cli_ord_id_1;
-             "contingencyType", `String "OneUpdatesTheOtherAbsolute";
-             "clOrdLinkID", `String p.S'.cli_ord_id;
-             "text", `String m.text;
-            ]
-            @ price_fields_of_dtc ordType1 ~p1:m.S.p1_1 ~p2:m.S.p2_1
-            @ execInst_of_dtc ordType1 tif stop_exec_inst;
-            ["symbol", `String m.S.symbol;
-             "orderQty", `Float qty_2;
-             "timeInForce", `String (string_of_tif tif);
-             "ordType", `String (string_of_ord_type ordType2);
-             "clOrdID", `String m.S.cli_ord_id_2;
-             "contingencyType", `String "OneUpdatesTheOtherAbsolute";
-             "clOrdLinkID", `String p.S'.cli_ord_id;
-             "text", `String m.text;
-            ]
-            @ price_fields_of_dtc ordType2 ~p1:m.S.p1_2 ~p2:m.S.p2_2
-            @ execInst_of_dtc ordType2 tif stop_exec_inst
-          ]
-      in
-      let body_str =
-        `Assoc [ "orders", `List List.(map orders ~f:(fun o -> `Assoc o)) ] |> Yojson.Safe.to_string
-      in
-      let body = Body.of_string body_str in
-      Log.debug log_bitmex "-> %s" body_str;
-      Rest.call ~name:"submit" ~f:begin fun uri ->
-        Client.post ~chunked:false ~body
-          ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `POST uri)
-          uri
-      end uri >>| function
-      | Ok _body ->
-        if m.parent <> "" then begin
-          String.Table.set parents m.cli_ord_id_1 m.parent;
-          String.Table.set parents m.cli_ord_id_2 m.parent;
-        end
-        else begin
-          String.Table.set parents m.cli_ord_id_1 m.cli_ord_id_1;
-          String.Table.set parents m.cli_ord_id_2 m.cli_ord_id_1;
-        end
-      | Error err ->
-        let err_str = Error.to_string_hum err in
-        Option.iter parent ~f:(fun p ->
-            Dtc_util.Trading.Order.Submit.reject order_update_cs p "%s" err_str;
-            Writer.write_cstruct w order_update_cs
-          );
-        reject order_update_cs m "%s" err_str;
-        Log.error log_bitmex "%s" err_str
-    in
-    if !my_exchange <> m.S.exchange then
-      reject order_update_cs m "Unknown exchange"
-    else if m.S.tif = Some `Good_till_date_time then
-      reject order_update_cs m "BitMEX does not support TIF Good till date time"
-    else if Option.is_none current_parent && m.S.parent <> "" then
-      reject order_update_cs m "%s/%s is a child of %s but parent could not be found"
-        m.cli_ord_id_1 m.cli_ord_id_2 m.S.parent
-    else
-      let on_exn ?p _ =
-        Option.iter p ~f:(fun p ->
-            Dtc_util.Trading.Order.Submit.reject order_update_cs p
-              "exception raised when trying to submit cli=%s" p.S'.cli_ord_id;
-            Writer.write_cstruct w order_update_cs
-          );
-        reject order_update_cs m
-          "exception raised when trying to submit OCO cli=%s,%s" m.cli_ord_id_1 m.cli_ord_id_2;
-        Deferred.unit
-      in
-      begin match current_parent with
-        | None ->
-          don't_wait_for @@ eat_exn ~on_exn (fun () -> accept_exn m)
-        | Some p when p.S'.cli_ord_id = m.S.parent ->
-          c.current_parent <- None;
-          don't_wait_for @@
-          eat_exn ~on_exn:(on_exn ~p) (fun () -> accept_exn ~parent:p m)
-        | Some p ->
-          c.current_parent <- None;
-          (* Reject the parent *)
-          Dtc_util.Trading.Order.Submit.reject order_update_cs p
-            "parent order %s deleted (child %s/%s has parent %s)"
-            p.cli_ord_id m.cli_ord_id_1 m.cli_ord_id_2 m.parent;
-          Writer.write_cstruct w order_update_cs;
-          (* Reject the child *)
-          reject order_update_cs m
-            "order %s/%s do not match stored parent %s (expected %s)"
-            m.cli_ord_id_1 m.cli_ord_id_2 p.cli_ord_id m.parent
-      end
+(*   | Some AccountBalanceRequest -> *)
+(*     let open Account.Balance in *)
+(*     let m = Request.read msg_cs in *)
+(*     let { addr_str; margin; _ } = Option.value_exn client in *)
+(*     let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in *)
+(*     let update_cs = Cstruct.of_bigarray ~off:0 ~len:Update.sizeof_cs scratchbuf in *)
+(*     let reject k = Printf.ksprintf begin fun reason -> *)
+(*         Reject.write r_cs ~request_id:m.id "%s" reason; *)
+(*         Writer.write_cstruct w r_cs; *)
+(*         Log.debug log_dtc "-> [%s] AccountBalanceRej" addr_str; *)
+(*       end k *)
+(*     in *)
+(*     let write_no_balances request_id = *)
+(*       Account.Balance.Update.write ~request_id ~nb_msgs:1 ~msg_number:1 ~no_account_balance:true update_cs; *)
+(*       Writer.write_cstruct w update_cs; *)
+(*       Log.debug log_dtc "-> [%s] no account balance" addr_str *)
+(*     in *)
+(*     let update ~msg_number ~nb_msgs account_id obj = *)
+(*       write_balance_update ~unsolicited:false ~msg_number ~nb_msgs update_cs obj; *)
+(*       Writer.write_cstruct w update_cs; *)
+(*       Log.debug log_dtc "-> [%s] account balance %d" addr_str account_id *)
+(*     in *)
+(*     Log.debug log_dtc "<- [%s] AccountBalanceReq (%s)" *)
+(*       addr_str m.Request.trade_account; *)
+(*     let nb_msgs = IS.Table.length margin in *)
+(*     if nb_msgs = 0 then *)
+(*       write_no_balances m.id *)
+(*     else if m.Request.trade_account = "" then *)
+(*       ignore @@ IS.Table.fold margin ~init:1 *)
+(*         ~f:(fun ~key:(account_id, currency) ~data msg_number -> *)
+(*             update ~msg_number ~nb_msgs account_id data; *)
+(*             succ msg_number *)
+(*           ) *)
+(*     else begin *)
+(*       match IS.Table.find margin (Int.of_string m.Request.trade_account, "XBt") *)
+(*       with *)
+(*       | Some obj -> update ~msg_number:1 ~nb_msgs:1 Int.(of_string m.Request.trade_account) obj *)
+(*       | None -> write_no_balances m.id *)
+(*       | exception _ -> reject "Invalid trade account %s" m.Request.trade_account *)
+(*     end *)
 
-  | Some CancelReplaceOrder ->
-    let open Trading.Order in
-    let reject m k =
-      let order_update_cs = Cstruct.of_bigarray ~off:0
-          ~len:Update.sizeof_cs scratchbuf
-      in
-      Printf.ksprintf begin fun reason ->
-        Update.write
-          ~nb_msgs:1
-          ~msg_number:1
-          ~reason:Cancel_replace_rejected
-          ~cli_ord_id:m.Replace.cli_ord_id
-          ~srv_ord_id:m.srv_ord_id
-          ?ord_type:m.Replace.ord_type
-          ~p1:m.Replace.p1
-          ~p2:m.Replace.p2
-          ~order_qty:m.Replace.qty
-          ?tif:m.Replace.tif
-          ~good_till_ts:m.Replace.good_till_ts
-          ~info_text:reason
-          order_update_cs;
-        Writer.write_cstruct w order_update_cs;
-        Log.debug log_dtc "-> [%s] CancelReplaceRej: %s" addr_str reason
-      end k
-    in
-    let m = Replace.read msg_cs in
-    let { addr_str; key; secret; order } = Option.value_exn client in
-    Log.debug log_dtc "<- [%s] %s" addr_str (Replace.show m);
-    let cancel_order_exn order =
-      let orderID = RespObj.string_exn order "orderID" in
-      let ord_type = RespObj.string_exn order "ordType" in
-      let ord_type = ord_type_of_string ord_type in
-      let uri = Uri.with_path !base_uri "/api/v1/order" in
-      let p1 = if m.p1_set then Some m.p1 else None in
-      let p2 = if m.p2_set then Some m.p2 else None in
-      let body = ([Some ("orderID", `String orderID);
-                   if m.Replace.qty <> 0. then Some ("orderQty", `Float m.Replace.qty) else None;
-                  ] |> List.filter_opt)
-                 @ price_fields_of_dtc ord_type ?p1 ?p2
-      in
-      let body_str = Yojson.Safe.to_string @@ `Assoc body in
-      let body = Body.of_string body_str in
-      Log.debug log_bitmex "-> %s" body_str;
-      Rest.call ~name:"cancel" ~f:begin fun uri ->
-        Client.put
-          ~chunked:false ~body
-          ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `PUT uri)
-            uri
-      end uri >>| function
-      | Ok body ->
-        Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body
-      | Error err ->
-        let err_str = Error.to_string_hum err in
-        reject m "%s" err_str;
-        Log.error log_bitmex "%s" err_str
-    in
-    if Option.is_some m.Replace.ord_type then
-      reject m "Modification of order type is not supported by BitMEX"
-    else if Option.is_some m.Replace.tif then
-      reject m "Modification of time in force is not supported by BitMEX"
-    else
-      let hex_srv_ord_id = uuid_of_b64 m.srv_ord_id in
-      let on_exn _ =
-        reject m "internal error when trying to cancel cli=%s srv=%s" m.cli_ord_id hex_srv_ord_id;
-        Deferred.unit
-      in
-      begin
-        match Uuid.Table.find order @@ Uuid.of_string hex_srv_ord_id with
-        | None -> reject m "internal error: %s not found in db" m.srv_ord_id
-        | Some o -> don't_wait_for @@ eat_exn ~on_exn ~log:log_bitmex (fun () -> cancel_order_exn o)
-      end
+(*   | Some SubmitNewSingleOrder -> *)
+(*     let module S = Trading.Order.Submit in *)
+(*     let module U = Trading.Order.Update in *)
+(*     let m = S.read msg_cs in *)
+(*     let { addr_str; key; secret; current_parent; stop_exec_inst } as c = Option.value_exn client in *)
+(*     let order_update_cs = Cstruct.of_bigarray ~off:0 ~len:U.sizeof_cs scratchbuf in *)
+(*     Log.debug log_dtc "<- [%s] %s" addr_str (S.show m); *)
+(*     let accept_exn () = *)
+(*       let uri = Uri.with_path !base_uri "/api/v1/order" in *)
+(*       let qty = match Option.value_exn ~message:"side is undefined" m.S.side with *)
+(*         | `Buy -> m.S.qty *)
+(*         | `Sell -> Float.neg m.S.qty *)
+(*       in *)
+(*       let tif = Option.value_exn ~message:"tif is undefined" m.tif in *)
+(*       let ordType = Option.value_exn ~message:"ordType is undefined" m.ord_type in *)
+(*       let tif = match tif with *)
+(*       | `Good_till_date_time -> invalid_arg "good_till_date_time" *)
+(*       | #time_in_force as tif -> tif in *)
+(*       let body = *)
+(*         ["symbol", `String m.S.symbol; *)
+(*          "orderQty", `Float qty; *)
+(*          "timeInForce", `String (string_of_tif tif); *)
+(*          "ordType", `String (string_of_ord_type ordType); *)
+(*          "clOrdID", `String m.S.cli_ord_id; *)
+(*          "text", `String m.text; *)
+(*         ] *)
+(*         @ price_fields_of_dtc ordType ~p1:m.S.p1 ~p2:m.S.p2 *)
+(*         @ execInst_of_dtc ordType tif stop_exec_inst *)
+(*       in *)
+(*       let body_str = Yojson.Safe.to_string @@ `Assoc body in *)
+(*       let body = Body.of_string body_str in *)
+(*       Log.debug log_bitmex "-> %s" body_str; *)
+(*       Rest.call ~name:"submit" ~f:begin fun uri -> *)
+(*         Client.post ~chunked:false ~body *)
+(*           ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `POST uri) uri *)
+(*       end uri >>| function *)
+(*       | Ok _body -> () *)
+(*       | Error err -> *)
+(*         let err_str = Error.to_string_hum err in *)
+(*         Dtc_util.Trading.Order.Submit.reject order_update_cs m "%s" err_str; *)
+(*         Writer.write_cstruct w order_update_cs; *)
+(*         Log.error log_bitmex "%s" err_str *)
+(*     in *)
+(*     if !my_exchange <> m.S.exchange then begin *)
+(*       Dtc_util.Trading.Order.Submit.reject order_update_cs m "Unknown exchange"; *)
+(*       Writer.write_cstruct w order_update_cs; *)
+(*     end *)
+(*     else if m.S.tif = Some `Good_till_date_time then begin *)
+(*       Dtc_util.Trading.Order.Submit.reject order_update_cs m "BitMEX does not support TIF Good till datetime"; *)
+(*       Writer.write_cstruct w order_update_cs; *)
+(*     end *)
+(*     else if Option.is_some current_parent then begin *)
+(*       c.current_parent <- None; *)
+(*       Dtc_util.Trading.Order.Submit.reject order_update_cs Option.(value_exn current_parent) "Next received order was not an OCO"; *)
+(*       Writer.write_cstruct w order_update_cs; *)
+(*       Dtc_util.Trading.Order.Submit.reject order_update_cs m "Previous received order was also a parent and the current order is not an OCO"; *)
+(*       Writer.write_cstruct w order_update_cs; *)
+(*     end *)
+(*     else if m.S.parent then begin *)
+(*       set_parent_order c m; *)
+(*       Dtc_util.Trading.Order.Submit.update *)
+(*         ~status:`Pending_open ~reason:General_order_update *)
+(*         order_update_cs m "parent order %s stored" m.S.cli_ord_id; *)
+(*       Writer.write_cstruct w order_update_cs; *)
+(*       Log.debug log_dtc "Stored parent order %s" m.S.cli_ord_id *)
+(*     end *)
+(*     else *)
+(*       let on_exn _ = *)
+(*         Dtc_util.Trading.Order.Submit.update *)
+(*           ~status:`Rejected ~reason:New_order_rejected *)
+(*           order_update_cs m *)
+(*           "exception raised when trying to submit %s" m.S.cli_ord_id; *)
+(*         Writer.write_cstruct w order_update_cs; *)
+(*         Deferred.unit *)
+(*       in *)
+(*       don't_wait_for @@ eat_exn ~on_exn accept_exn *)
 
-  | Some CancelOrder ->
-    let open Trading.Order in
-    let reject m k =
-      let order_update_cs = Cstruct.of_bigarray ~off:0
-          ~len:Update.sizeof_cs scratchbuf
-      in
-      Printf.ksprintf begin fun reason ->
-          Update.write
-            ~nb_msgs:1
-            ~msg_number:1
-            ~reason:Cancel_rejected
-            ~cli_ord_id:m.Cancel.cli_ord_id
-            ~srv_ord_id:m.srv_ord_id
-            ~info_text:reason
-            order_update_cs;
-          Writer.write_cstruct w order_update_cs;
-          Log.debug log_dtc "-> [%s] CancelOrderRej: %s" addr_str reason
-      end k
-    in
-    let m = Cancel.read msg_cs in
-    let hex_srv_ord_id = uuid_of_b64 m.srv_ord_id in
-    let { addr_str; key; secret; parents; } = Option.value_exn client in
-    Log.debug log_dtc "<- [%s] Cancelorder cli=%s srv=%s" addr_str m.cli_ord_id hex_srv_ord_id;
-    let cancel_order_exn = function
-      | None -> begin
-        let uri = Uri.with_path !base_uri "/api/v1/order" in
-        let body_str = `Assoc ["orderID", `String hex_srv_ord_id] |> Yojson.Safe.to_string in
-        let body = Body.of_string body_str in
-        Client.delete
-          ~chunked:false ~body
-          ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `DELETE uri)
-          uri >>= function (resp, body) ->
-          Body.to_string body >>| fun body_str ->
-          Log.debug log_bitmex "<- %s" body_str
-        end
-      | Some linkId -> begin
-        let uri = Uri.with_path !base_uri "/api/v1/order/all" in
-        let body_str = `Assoc ["filter", `Assoc ["clOrdLinkID", `String linkId]] |> Yojson.Safe.to_string in
-        let body = Body.of_string body_str in
-        Client.delete
-          ~chunked:false ~body
-          ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `DELETE uri)
-          uri >>= function (resp, body) ->
-          Body.to_string body >>| fun body_str ->
-          Log.debug log_bitmex "<- %s" body_str
-        end
-    in
-    let on_exn _ =
-      reject m "exception raised while trying to cancel cli=%s srv=%s" m.cli_ord_id m.srv_ord_id;
-      Deferred.unit
-    in
-    let parent = String.Table.find parents m.cli_ord_id in
-    don't_wait_for @@ eat_exn ~on_exn ~log:log_bitmex
-      (fun () -> cancel_order_exn parent)
+(*   | Some SubmitNewOCOOrder -> *)
+(*     let module S = Trading.Order.SubmitOCO in *)
+(*     let module S' = Trading.Order.Submit in *)
+(*     let module U = Trading.Order.Update in *)
+(*     let m = S.read msg_cs in *)
+(*     let { addr_str; key; secret; current_parent; parents; stop_exec_inst } as c = Option.value_exn client in *)
+(*     let order_update_cs = Cstruct.of_bigarray ~off:0 ~len:U.sizeof_cs scratchbuf in *)
+(*     Log.debug log_dtc "<- [%s] %s" addr_str (S.show m); *)
+(*     let reject cs m k = Printf.ksprintf begin fun reason -> *)
+(*         U.write *)
+(*           ~nb_msgs:1 *)
+(*           ~msg_number:1 *)
+(*           ~trade_account:m.S.trade_account *)
+(*           ~status:`Rejected *)
+(*           ~reason:New_order_rejected *)
+(*           ~cli_ord_id:m.S.cli_ord_id_1 *)
+(*           ~symbol:m.S.symbol *)
+(*           ~exchange:m.S.exchange *)
+(*           ?ord_type:m.S.ord_type_1 *)
+(*           ?side:m.S.side_1 *)
+(*           ~p1:m.S.p1_1 *)
+(*           ~p2:m.S.p2_1 *)
+(*           ~order_qty:m.S.qty_1 *)
+(*           ?tif:m.S.tif *)
+(*           ~good_till_ts:m.S.good_till_ts *)
+(*           ~info_text:reason *)
+(*           ~free_form_text:m.text *)
+(*           cs; *)
+(*         Writer.write_cstruct w cs; *)
+(*         Log.debug log_dtc "-> [%s] Reject (%s)" addr_str reason; *)
+(*         U.write *)
+(*           ~nb_msgs:1 *)
+(*           ~msg_number:1 *)
+(*           ~trade_account:m.S.trade_account *)
+(*           ~status:`Rejected *)
+(*           ~reason:New_order_rejected *)
+(*           ~cli_ord_id:m.S.cli_ord_id_2 *)
+(*           ~symbol:m.S.symbol *)
+(*           ~exchange:m.S.exchange *)
+(*           ?ord_type:m.S.ord_type_2 *)
+(*           ?side:m.S.side_2 *)
+(*           ~p1:m.S.p1_2 *)
+(*           ~p2:m.S.p2_2 *)
+(*           ~order_qty:m.S.qty_2 *)
+(*           ?tif:m.S.tif *)
+(*           ~good_till_ts:m.S.good_till_ts *)
+(*           ~info_text:reason *)
+(*           ~free_form_text:m.text *)
+(*           cs; *)
+(*         Writer.write_cstruct w cs; *)
+(*         Log.debug log_dtc "-> [%s] SubmitOCORej: %s" addr_str reason *)
+(*       end k *)
+(*     in *)
+(*     let accept_exn ?parent m = *)
+(*       let uri = Uri.with_path !base_uri "/api/v1/order/bulk" in *)
+(*       let qty_1 = match m.S.side_1 with *)
+(*         | Some `Buy -> m.S.qty_1 *)
+(*         | Some `Sell -> Float.neg m.S.qty_1 *)
+(*         | None -> invalid_arg "side1 is undefined" *)
+(*       in *)
+(*       let qty_2 = match m.S.side_2 with *)
+(*         | Some `Buy -> m.S.qty_2 *)
+(*         | Some `Sell -> Float.neg m.S.qty_2 *)
+(*         | None -> invalid_arg "side2 is undefined" *)
+(*       in *)
+(*       let tif = Option.value_exn ~message:"tif is undefined" m.tif in *)
+(*       let tif = match tif with *)
+(*       | `Good_till_date_time -> invalid_arg "good_till_date_time" *)
+(*       | #time_in_force as tif -> tif in *)
+(*       let ordType1 = Option.value_exn ~message:"ordType1 is undefined" m.ord_type_1 in *)
+(*       let ordType2 = Option.value_exn ~message:"ordType2 is undefined" m.ord_type_2 in *)
+(*       let orders = match parent with *)
+(*         | None -> *)
+(*           [ *)
+(*             ["symbol", `String m.S.symbol; *)
+(*              "orderQty", `Float qty_1; *)
+(*              "timeInForce", `String (string_of_tif tif); *)
+(*              "ordType", `String (string_of_ord_type ordType1); *)
+(*              "clOrdID", `String m.S.cli_ord_id_1; *)
+(*              "contingencyType", `String "OneUpdatesTheOtherAbsolute"; *)
+(*              "clOrdLinkID", `String m.S.cli_ord_id_1; *)
+(*              "text", `String m.text; *)
+(*             ] *)
+(*             @ price_fields_of_dtc ordType1 ~p1:m.S.p1_1 ~p2:m.S.p2_1 *)
+(*             @ execInst_of_dtc ordType1 tif stop_exec_inst; *)
+(*             ["symbol", `String m.S.symbol; *)
+(*              "orderQty", `Float qty_2; *)
+(*              "timeInForce", `String (string_of_tif tif); *)
+(*              "ordType", `String (string_of_ord_type ordType2); *)
+(*              "clOrdID", `String m.S.cli_ord_id_2; *)
+(*              "contingencyType", `String "OneUpdatesTheOtherAbsolute"; *)
+(*              "clOrdLinkID", `String m.S.cli_ord_id_1; *)
+(*              "text", `String m.text; *)
+(*             ] *)
+(*             @ price_fields_of_dtc ordType2 ~p1:m.S.p1_2 ~p2:m.S.p2_2 *)
+(*             @ execInst_of_dtc ordType2 tif stop_exec_inst; *)
+(*           ] *)
+(*         | Some p -> *)
+(*           let p_qty = match p.S'.side with *)
+(*             | Some `Buy -> p.S'.qty *)
+(*             | Some `Sell -> Float.neg p.S'.qty *)
+(*             | None -> invalid_arg "side is undefined" *)
+(*           in *)
+(*           let pTif = Option.value_exn ~message:"tif is undefined" p.tif in *)
+(*           let pTif = match pTif with *)
+(*           | `Good_till_date_time -> invalid_arg "good_till_date_time" *)
+(*           | #time_in_force as tif -> tif in *)
+(*           let pOrdType = Option.value_exn ~message:"ordType1 is undefined" p.ord_type in *)
+(*           [ *)
+(*             ["symbol", `String p.S'.symbol; *)
+(*              "orderQty", `Float p_qty; *)
+(*              "timeInForce", `String (string_of_tif pTif); *)
+(*              "ordType", `String (string_of_ord_type pOrdType); *)
+(*              "clOrdID", `String p.S'.cli_ord_id; *)
+(*              "contingencyType", `String "OneTriggersTheOther"; *)
+(*              "clOrdLinkID", `String p.S'.cli_ord_id; *)
+(*              "text", `String p.text; *)
+(*             ] *)
+(*             @ price_fields_of_dtc pOrdType ~p1:p.S'.p1 ~p2:p.S'.p2 *)
+(*             @ execInst_of_dtc pOrdType pTif stop_exec_inst; *)
+(*             ["symbol", `String m.S.symbol; *)
+(*              "orderQty", `Float qty_1; *)
+(*              "timeInForce", `String (string_of_tif tif); *)
+(*              "ordType", `String (string_of_ord_type ordType1); *)
+(*              "clOrdID", `String m.S.cli_ord_id_1; *)
+(*              "contingencyType", `String "OneUpdatesTheOtherAbsolute"; *)
+(*              "clOrdLinkID", `String p.S'.cli_ord_id; *)
+(*              "text", `String m.text; *)
+(*             ] *)
+(*             @ price_fields_of_dtc ordType1 ~p1:m.S.p1_1 ~p2:m.S.p2_1 *)
+(*             @ execInst_of_dtc ordType1 tif stop_exec_inst; *)
+(*             ["symbol", `String m.S.symbol; *)
+(*              "orderQty", `Float qty_2; *)
+(*              "timeInForce", `String (string_of_tif tif); *)
+(*              "ordType", `String (string_of_ord_type ordType2); *)
+(*              "clOrdID", `String m.S.cli_ord_id_2; *)
+(*              "contingencyType", `String "OneUpdatesTheOtherAbsolute"; *)
+(*              "clOrdLinkID", `String p.S'.cli_ord_id; *)
+(*              "text", `String m.text; *)
+(*             ] *)
+(*             @ price_fields_of_dtc ordType2 ~p1:m.S.p1_2 ~p2:m.S.p2_2 *)
+(*             @ execInst_of_dtc ordType2 tif stop_exec_inst *)
+(*           ] *)
+(*       in *)
+(*       let body_str = *)
+(*         `Assoc [ "orders", `List List.(map orders ~f:(fun o -> `Assoc o)) ] |> Yojson.Safe.to_string *)
+(*       in *)
+(*       let body = Body.of_string body_str in *)
+(*       Log.debug log_bitmex "-> %s" body_str; *)
+(*       Rest.call ~name:"submit" ~f:begin fun uri -> *)
+(*         Client.post ~chunked:false ~body *)
+(*           ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `POST uri) *)
+(*           uri *)
+(*       end uri >>| function *)
+(*       | Ok _body -> *)
+(*         if m.parent <> "" then begin *)
+(*           String.Table.set parents m.cli_ord_id_1 m.parent; *)
+(*           String.Table.set parents m.cli_ord_id_2 m.parent; *)
+(*         end *)
+(*         else begin *)
+(*           String.Table.set parents m.cli_ord_id_1 m.cli_ord_id_1; *)
+(*           String.Table.set parents m.cli_ord_id_2 m.cli_ord_id_1; *)
+(*         end *)
+(*       | Error err -> *)
+(*         let err_str = Error.to_string_hum err in *)
+(*         Option.iter parent ~f:(fun p -> *)
+(*             Dtc_util.Trading.Order.Submit.reject order_update_cs p "%s" err_str; *)
+(*             Writer.write_cstruct w order_update_cs *)
+(*           ); *)
+(*         reject order_update_cs m "%s" err_str; *)
+(*         Log.error log_bitmex "%s" err_str *)
+(*     in *)
+(*     if !my_exchange <> m.S.exchange then *)
+(*       reject order_update_cs m "Unknown exchange" *)
+(*     else if m.S.tif = Some `Good_till_date_time then *)
+(*       reject order_update_cs m "BitMEX does not support TIF Good till date time" *)
+(*     else if Option.is_none current_parent && m.S.parent <> "" then *)
+(*       reject order_update_cs m "%s/%s is a child of %s but parent could not be found" *)
+(*         m.cli_ord_id_1 m.cli_ord_id_2 m.S.parent *)
+(*     else *)
+(*       let on_exn ?p _ = *)
+(*         Option.iter p ~f:(fun p -> *)
+(*             Dtc_util.Trading.Order.Submit.reject order_update_cs p *)
+(*               "exception raised when trying to submit cli=%s" p.S'.cli_ord_id; *)
+(*             Writer.write_cstruct w order_update_cs *)
+(*           ); *)
+(*         reject order_update_cs m *)
+(*           "exception raised when trying to submit OCO cli=%s,%s" m.cli_ord_id_1 m.cli_ord_id_2; *)
+(*         Deferred.unit *)
+(*       in *)
+(*       begin match current_parent with *)
+(*         | None -> *)
+(*           don't_wait_for @@ eat_exn ~on_exn (fun () -> accept_exn m) *)
+(*         | Some p when p.S'.cli_ord_id = m.S.parent -> *)
+(*           c.current_parent <- None; *)
+(*           don't_wait_for @@ *)
+(*           eat_exn ~on_exn:(on_exn ~p) (fun () -> accept_exn ~parent:p m) *)
+(*         | Some p -> *)
+(*           c.current_parent <- None; *)
+(*           (\* Reject the parent *\) *)
+(*           Dtc_util.Trading.Order.Submit.reject order_update_cs p *)
+(*             "parent order %s deleted (child %s/%s has parent %s)" *)
+(*             p.cli_ord_id m.cli_ord_id_1 m.cli_ord_id_2 m.parent; *)
+(*           Writer.write_cstruct w order_update_cs; *)
+(*           (\* Reject the child *\) *)
+(*           reject order_update_cs m *)
+(*             "order %s/%s do not match stored parent %s (expected %s)" *)
+(*             m.cli_ord_id_1 m.cli_ord_id_2 p.cli_ord_id m.parent *)
+(*       end *)
 
-  | Some _
-  | None ->
-    let buf = Buffer.create 128 in
-    Cstruct.hexdump_to_buffer buf msg_cs;
-    Log.error log_dtc "%s" @@ Buffer.contents buf
+(*   | Some CancelReplaceOrder -> *)
+(*     let open Trading.Order in *)
+(*     let reject m k = *)
+(*       let order_update_cs = Cstruct.of_bigarray ~off:0 *)
+(*           ~len:Update.sizeof_cs scratchbuf *)
+(*       in *)
+(*       Printf.ksprintf begin fun reason -> *)
+(*         Update.write *)
+(*           ~nb_msgs:1 *)
+(*           ~msg_number:1 *)
+(*           ~reason:Cancel_replace_rejected *)
+(*           ~cli_ord_id:m.Replace.cli_ord_id *)
+(*           ~srv_ord_id:m.srv_ord_id *)
+(*           ?ord_type:m.Replace.ord_type *)
+(*           ~p1:m.Replace.p1 *)
+(*           ~p2:m.Replace.p2 *)
+(*           ~order_qty:m.Replace.qty *)
+(*           ?tif:m.Replace.tif *)
+(*           ~good_till_ts:m.Replace.good_till_ts *)
+(*           ~info_text:reason *)
+(*           order_update_cs; *)
+(*         Writer.write_cstruct w order_update_cs; *)
+(*         Log.debug log_dtc "-> [%s] CancelReplaceRej: %s" addr_str reason *)
+(*       end k *)
+(*     in *)
+(*     let m = Replace.read msg_cs in *)
+(*     let { addr_str; key; secret; order } = Option.value_exn client in *)
+(*     Log.debug log_dtc "<- [%s] %s" addr_str (Replace.show m); *)
+(*     let cancel_order_exn order = *)
+(*       let orderID = RespObj.string_exn order "orderID" in *)
+(*       let ord_type = RespObj.string_exn order "ordType" in *)
+(*       let ord_type = ord_type_of_string ord_type in *)
+(*       let uri = Uri.with_path !base_uri "/api/v1/order" in *)
+(*       let p1 = if m.p1_set then Some m.p1 else None in *)
+(*       let p2 = if m.p2_set then Some m.p2 else None in *)
+(*       let body = ([Some ("orderID", `String orderID); *)
+(*                    if m.Replace.qty <> 0. then Some ("orderQty", `Float m.Replace.qty) else None; *)
+(*                   ] |> List.filter_opt) *)
+(*                  @ price_fields_of_dtc ord_type ?p1 ?p2 *)
+(*       in *)
+(*       let body_str = Yojson.Safe.to_string @@ `Assoc body in *)
+(*       let body = Body.of_string body_str in *)
+(*       Log.debug log_bitmex "-> %s" body_str; *)
+(*       Rest.call ~name:"cancel" ~f:begin fun uri -> *)
+(*         Client.put *)
+(*           ~chunked:false ~body *)
+(*           ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `PUT uri) *)
+(*             uri *)
+(*       end uri >>| function *)
+(*       | Ok body -> *)
+(*         Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body *)
+(*       | Error err -> *)
+(*         let err_str = Error.to_string_hum err in *)
+(*         reject m "%s" err_str; *)
+(*         Log.error log_bitmex "%s" err_str *)
+(*     in *)
+(*     if Option.is_some m.Replace.ord_type then *)
+(*       reject m "Modification of order type is not supported by BitMEX" *)
+(*     else if Option.is_some m.Replace.tif then *)
+(*       reject m "Modification of time in force is not supported by BitMEX" *)
+(*     else *)
+(*       let hex_srv_ord_id = uuid_of_b64 m.srv_ord_id in *)
+(*       let on_exn _ = *)
+(*         reject m "internal error when trying to cancel cli=%s srv=%s" m.cli_ord_id hex_srv_ord_id; *)
+(*         Deferred.unit *)
+(*       in *)
+(*       begin *)
+(*         match Uuid.Table.find order @@ Uuid.of_string hex_srv_ord_id with *)
+(*         | None -> reject m "internal error: %s not found in db" m.srv_ord_id *)
+(*         | Some o -> don't_wait_for @@ eat_exn ~on_exn ~log:log_bitmex (fun () -> cancel_order_exn o) *)
+(*       end *)
+
+(*   | Some CancelOrder -> *)
+(*     let open Trading.Order in *)
+(*     let reject m k = *)
+(*       let order_update_cs = Cstruct.of_bigarray ~off:0 *)
+(*           ~len:Update.sizeof_cs scratchbuf *)
+(*       in *)
+(*       Printf.ksprintf begin fun reason -> *)
+(*           Update.write *)
+(*             ~nb_msgs:1 *)
+(*             ~msg_number:1 *)
+(*             ~reason:Cancel_rejected *)
+(*             ~cli_ord_id:m.Cancel.cli_ord_id *)
+(*             ~srv_ord_id:m.srv_ord_id *)
+(*             ~info_text:reason *)
+(*             order_update_cs; *)
+(*           Writer.write_cstruct w order_update_cs; *)
+(*           Log.debug log_dtc "-> [%s] CancelOrderRej: %s" addr_str reason *)
+(*       end k *)
+(*     in *)
+(*     let m = Cancel.read msg_cs in *)
+(*     let hex_srv_ord_id = uuid_of_b64 m.srv_ord_id in *)
+(*     let { addr_str; key; secret; parents; } = Option.value_exn client in *)
+(*     Log.debug log_dtc "<- [%s] Cancelorder cli=%s srv=%s" addr_str m.cli_ord_id hex_srv_ord_id; *)
+(*     let cancel_order_exn = function *)
+(*       | None -> begin *)
+(*         let uri = Uri.with_path !base_uri "/api/v1/order" in *)
+(*         let body_str = `Assoc ["orderID", `String hex_srv_ord_id] |> Yojson.Safe.to_string in *)
+(*         let body = Body.of_string body_str in *)
+(*         Client.delete *)
+(*           ~chunked:false ~body *)
+(*           ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `DELETE uri) *)
+(*           uri >>= function (resp, body) -> *)
+(*           Body.to_string body >>| fun body_str -> *)
+(*           Log.debug log_bitmex "<- %s" body_str *)
+(*         end *)
+(*       | Some linkId -> begin *)
+(*         let uri = Uri.with_path !base_uri "/api/v1/order/all" in *)
+(*         let body_str = `Assoc ["filter", `Assoc ["clOrdLinkID", `String linkId]] |> Yojson.Safe.to_string in *)
+(*         let body = Body.of_string body_str in *)
+(*         Client.delete *)
+(*           ~chunked:false ~body *)
+(*           ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `DELETE uri) *)
+(*           uri >>= function (resp, body) -> *)
+(*           Body.to_string body >>| fun body_str -> *)
+(*           Log.debug log_bitmex "<- %s" body_str *)
+(*         end *)
+(*     in *)
+(*     let on_exn _ = *)
+(*       reject m "exception raised while trying to cancel cli=%s srv=%s" m.cli_ord_id m.srv_ord_id; *)
+(*       Deferred.unit *)
+(*     in *)
+(*     let parent = String.Table.find parents m.cli_ord_id in *)
+(*     don't_wait_for @@ eat_exn ~on_exn ~log:log_bitmex *)
+(*       (fun () -> cancel_order_exn parent) *)
+
+(*   | Some _ *)
+(*   | None -> *)
+(*     let buf = Buffer.create 128 in *)
+(*     Cstruct.hexdump_to_buffer buf msg_cs; *)
+(*     Log.error log_dtc "%s" @@ Buffer.contents buf *)
+
+(* let dtcserver ~server ~port = *)
+(*   let server_fun addr r w = *)
+(*     (\* So that process does not allocate all the time. *\) *)
+(*     let scratchbuf = Bigstring.create 1024 in *)
+(*     let rec handle_chunk w consumed buf ~pos ~len = *)
+(*       if len < 2 then return @@ `Consumed (consumed, `Need_unknown) *)
+(*       else *)
+(*         let msglen = Bigstring.unsafe_get_int16_le buf ~pos in *)
+(*         if len < msglen then return @@ `Consumed (consumed, `Need msglen) *)
+(*         else begin *)
+(*           let msg_cs = Cstruct.of_bigarray buf ~off:pos ~len:msglen in *)
+(*           process addr w msg_cs scratchbuf; *)
+(*           handle_chunk w (consumed + msglen) buf (pos + msglen) (len - msglen) *)
+(*         end *)
+(*     in *)
+(*     let on_client_io_error exn = *)
+(*       Log.error log_dtc "on_client_io_error (%s): %s" *)
+(*         Socket.Address.(to_string addr) Exn.(to_string exn) *)
+(*     in *)
+(*     let cleanup r w = *)
+(*       Log.info log_dtc "client %s disconnected" Socket.Address.(to_string addr); *)
+(*       let { ws_uuid } = InetAddr.Table.find_exn clients addr in *)
+(*       let addr_str = InetAddr.sexp_of_t addr |> Sexp.to_string in *)
+(*       InetAddr.Table.remove clients addr; *)
+(*       Deferred.all_unit [Pipe.write client_ws_w @@ Unsubscribe (ws_uuid, addr_str); Writer.close w; Reader.close r] *)
+(*     in *)
+(*     Deferred.ignore @@ Monitor.protect *)
+(*       ~name:"server_fun" *)
+(*       ~finally:(fun () -> cleanup r w) *)
+(*       (fun () -> *)
+(*          Monitor.detach_and_iter_errors Writer.(monitor w) ~f:on_client_io_error; *)
+(*          Reader.(read_one_chunk_at_a_time r ~handle_chunk:(handle_chunk w 0)) *)
+(*       ) *)
+(*   in *)
+(*   let on_handler_error_f addr exn = *)
+(*     Log.error log_dtc "on_handler_error (%s): %s" *)
+(*       Socket.Address.(to_string addr) Exn.(to_string exn) *)
+(*   in *)
+(*   Conduit_async.serve *)
+(*     ~on_handler_error:(`Call on_handler_error_f) *)
+(*     server (Tcp.on_port port) server_fun *)
 
 let dtcserver ~server ~port =
   let server_fun addr r w =
+    let addr = Socket.Address.Inet.to_string addr in
     (* So that process does not allocate all the time. *)
-    let scratchbuf = Bigstring.create 1024 in
-    let rec handle_chunk w consumed buf ~pos ~len =
+    let rec handle_chunk consumed buf ~pos ~len =
       if len < 2 then return @@ `Consumed (consumed, `Need_unknown)
       else
         let msglen = Bigstring.unsafe_get_int16_le buf ~pos in
+        Log.debug log_dtc "handle_chunk: pos=%d len=%d, msglen=%d" pos len msglen;
         if len < msglen then return @@ `Consumed (consumed, `Need msglen)
         else begin
-          let msg_cs = Cstruct.of_bigarray buf ~off:pos ~len:msglen in
-          process addr w msg_cs scratchbuf;
-          handle_chunk w (consumed + msglen) buf (pos + msglen) (len - msglen)
+          let msgtype_int = Bigstring.unsafe_get_int16_le buf ~pos:(pos+2) in
+          let msgtype : DTC.dtcmessage_type =
+            DTC.parse_dtcmessage_type (Piqirun.Varint msgtype_int) in
+          let msg_str = Bigstring.To_string.subo buf ~pos:(pos+4) ~len:(msglen-4) in
+          let msg = Piqirun.init_from_string msg_str in
+          begin match msgtype with
+            | `encoding_request ->
+              begin match (Dtc_pb.Encoding.read (Bigstring.To_string.subo buf ~pos ~len:16)) with
+                | None -> Log.error log_dtc "Invalid encoding request received"
+                | Some msg -> encoding_request addr w msg
+              end
+            | `logon_request -> logon_request addr w msg
+            | `heartbeat -> heartbeat addr w msg
+            | `security_definition_for_symbol_request -> security_definition_request addr w msg
+            | `market_data_request -> market_data_request addr w msg
+            | `market_depth_request -> market_depth_request addr w msg
+            | `open_orders_request -> open_orders_request addr w msg
+            | `current_positions_request -> current_positions_request addr w msg
+            | `historical_order_fills_request -> historical_order_fills addr w msg
+            | `trade_accounts_request -> trade_account_request addr w msg
+            | `account_balance_request -> account_balance_request addr w msg
+            | `submit_new_single_order -> submit_new_single_order addr w msg
+            | `cancel_order -> cancel_order addr w msg
+            | `cancel_replace_order -> cancel_replace_order addr w msg
+            | #DTC.dtcmessage_type ->
+              Log.error log_dtc "Unknown msg type %d" msgtype_int
+          end ;
+          handle_chunk (consumed + msglen) buf (pos + msglen) (len - msglen)
         end
     in
-    let on_client_io_error exn =
-      Log.error log_dtc "on_client_io_error (%s): %s"
-        Socket.Address.(to_string addr) Exn.(to_string exn)
+    let on_connection_io_error exn =
+      String.Table.remove Connection.active addr ;
+      Log.error log_dtc "on_connection_io_error (%s): %s" addr Exn.(to_string exn)
     in
-    let cleanup r w =
-      Log.info log_dtc "client %s disconnected" Socket.Address.(to_string addr);
-      let { ws_uuid } = InetAddr.Table.find_exn clients addr in
-      let addr_str = InetAddr.sexp_of_t addr |> Sexp.to_string in
-      InetAddr.Table.remove clients addr;
-      Deferred.all_unit [Pipe.write client_ws_w @@ Unsubscribe (ws_uuid, addr_str); Writer.close w; Reader.close r]
+    let cleanup () =
+      Log.info log_dtc "client %s disconnected" addr ;
+      String.Table.remove Connection.active addr ;
+      Deferred.all_unit [Writer.close w; Reader.close r]
     in
-    Deferred.ignore @@ Monitor.protect
-      ~name:"server_fun"
-      ~finally:(fun () -> cleanup r w)
-      (fun () ->
-         Monitor.detach_and_iter_errors Writer.(monitor w) ~f:on_client_io_error;
-         Reader.(read_one_chunk_at_a_time r ~handle_chunk:(handle_chunk w 0))
-      )
+    Deferred.ignore @@ Monitor.protect ~finally:cleanup begin fun () ->
+      Monitor.detach_and_iter_errors Writer.(monitor w) ~f:on_connection_io_error;
+      Reader.(read_one_chunk_at_a_time r ~handle_chunk:(handle_chunk 0))
+    end
   in
   let on_handler_error_f addr exn =
     Log.error log_dtc "on_handler_error (%s): %s"
