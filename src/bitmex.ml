@@ -76,8 +76,10 @@ module Connection = struct
     margin: RespObj.t IS.Table.t; (* indexed by account, currency *)
     order: RespObj.t Uuid.Table.t; (* indexed by orderID *)
     mutable dropped: int;
-    subs: int String.Table.t;
-    subs_depth: int String.Table.t;
+    subs: int32 String.Table.t;
+    rev_subs: string Int32.Table.t;
+    subs_depth: int32 String.Table.t;
+    rev_subs_depth: string Int32.Table.t;
     mutable current_parent: DTC.Submit_new_single_order.t option;
     parents: string String.Table.t;
     stop_exec_inst: ExecInst.t ;
@@ -92,7 +94,9 @@ module Connection = struct
       margin = IS.Table.create () ;
       order = Uuid.Table.create () ;
       subs = String.Table.create () ;
+      rev_subs = Int32.Table.create () ;
       subs_depth = String.Table.create () ;
+      rev_subs_depth = Int32.Table.create () ;
       parents = String.Table.create () ;
       stop_exec_inst ;
 
@@ -104,6 +108,9 @@ module Connection = struct
   let active : t String.Table.t = String.Table.create ()
 
   let find = String.Table.find active
+  let find_exn = String.Table.find_exn active
+  let set = String.Table.set active
+  let remove = String.Table.remove active
 
   let set_parent_order conn order =
     conn.current_parent <- Some order;
@@ -163,7 +170,11 @@ module Instrument = struct
 
   let active : t String.Table.t = String.Table.create ()
 
+  let mem = String.Table.mem active
   let find = String.Table.find active
+  let find_exn = String.Table.find_exn active
+  let set = String.Table.set active
+  let remove = String.Table.remove active
 end
 
 let bitmex_historical = ref ""
@@ -213,11 +224,17 @@ let send_heartbeat { Connection.addr; w; dropped } ival =
   | Error _ -> Log.error log_dtc "-/-> %s HB" addr
   | Ok _ -> ()
 
+let seconds_of_ts_string ts =
+  Time_ns.(to_int_ns_since_epoch (of_string ts) / 1_000_000_000) |>
+  Int64.of_int
+
+let float_of_ts ts =
+  Time_ns.to_int_ns_since_epoch ts // 1_000_000_000
+
+let float_of_ts_string ts =
+  Time_ns.(to_int_ns_since_epoch (of_string ts) // 1_000_000_000)
+
 let write_order_update ~nb_msgs ~msg_number w e =
-  let seconds_of_ts_string ts =
-    Time_ns.(to_int_ns_since_epoch (of_string ts) / 1_000_000_000) |>
-    Int64.of_int
-  in
   let invalid_arg' execType ordStatus =
     invalid_arg Printf.(sprintf "write_order_update: execType=%s, ordStatus=%s" execType ordStatus)
   in
@@ -543,7 +560,8 @@ let logon_request addr w msg =
 
 let heartbeat addr w msg =  Log.debug log_dtc "<- [%s] Heartbeat" addr
 
-let security_definition_reject addr w request_id k = Printf.ksprintf begin fun msg ->
+let security_definition_reject addr w request_id k =
+  Printf.ksprintf begin fun msg ->
     let resp = DTC.default_security_definition_reject () in
     resp.request_id <- Some request_id ;
     resp.reject_text <- Some msg ;
@@ -573,6 +591,97 @@ let security_definition_request addr w msg =
   | _ ->
     Log.error log_dtc "<- [%s] BAD Security Definition Request" addr
 
+let reject_market_data_request ?id addr w k =
+  Printf.ksprintf begin fun reason ->
+    let resp = DTC.default_market_data_reject () in
+    resp.symbol_id <- id ;
+    resp.reject_text <- Some reason ;
+    Log.debug log_dtc "-> [%s] Market Data Reject" addr ;
+    write_message w `market_data_reject DTC.gen_market_data_reject resp
+  end k
+
+let write_market_data_snapshot ?id addr w symbol
+    { Instrument.instrObj; last_trade_price;
+      last_trade_size; last_trade_ts; last_quote_ts } =
+  if Instrument.is_index symbol then begin
+    let snap = DTC.default_market_data_snapshot () in
+    snap.symbol_id <- id ;
+    snap.session_settlement_price <- RespObj.float instrObj "prevPrice24h" ;
+    snap.last_trade_price <- RespObj.float instrObj "lastPrice" ;
+    snap.last_trade_date_time <-
+      RespObj.string instrObj "timestamp" |> Option.map ~f:float_of_ts_string ;
+    write_message w `market_data_snapshot DTC.gen_market_data_snapshot snap
+  end
+  else begin
+    let { Quote.bidPrice; bidSize; askPrice; askSize } = String.Table.find_exn quotes symbol in
+    let open Option in
+    let open RespObj in
+    let snap = DTC.default_market_data_snapshot () in
+    snap.session_settlement_price <-
+      Some (value ~default:Float.max_finite_value (float instrObj "indicativeSettlePrice")) ;
+    snap.session_high_price <-
+      Some (value ~default:Float.max_finite_value @@ float instrObj "highPrice") ;
+    snap.session_low_price <-
+      Some (value ~default:Float.max_finite_value @@ float instrObj "lowPrice") ;
+    snap.session_volume <-
+      Some (value_map (int64 instrObj "volume") ~default:Float.max_finite_value ~f:Int64.to_float) ;
+    snap.open_interest <-
+      Some (value_map (int64 instrObj "openInterest") ~default:0xffffffffl ~f:Int64.to_int32_exn) ;
+    snap.bid_price <- bidPrice ;
+    snap.bid_quantity <- Option.(map bidSize ~f:Float.of_int) ;
+    snap.ask_price <- askPrice ;
+    snap.ask_quantity <- Option.(map askSize ~f:Float.of_int) ;
+    snap.last_trade_price <- Some last_trade_price ;
+    snap.last_trade_volume <- Some (Int.to_float last_trade_size) ;
+    snap.last_trade_date_time <- Some (float_of_ts last_trade_ts) ;
+    snap.bid_ask_date_time <- Some (float_of_ts last_quote_ts) ;
+    write_message w `market_data_snapshot DTC.gen_market_data_snapshot snap
+  end
+
+let market_data_request addr w msg =
+  let req = DTC.parse_market_data_request msg in
+  let { Connection.subs ; rev_subs } = Connection.find_exn addr in
+  match req.request_action,
+        req.symbol_id,
+        req.symbol,
+        req.exchange
+  with
+  | _, id, Some symbol, Some exchange
+    when exchange <> !my_exchange && Instrument.(is_index symbol) ->
+    reject_market_data_request ?id addr w "No such exchange %s" exchange
+  | _, id, Some symbol, _ when not (Instrument.mem symbol) ->
+    reject_market_data_request ?id addr w "No such symbol %s" symbol
+  | Some `unsubscribe, Some id, _, _ ->
+    begin match Int32.Table.find rev_subs id with
+    | None -> ()
+    | Some symbol -> String.Table.remove subs symbol
+    end ;
+    Int32.Table.remove rev_subs id
+  | Some `snapshot, id, Some symbol, Some exchange ->
+    Log.debug log_dtc "<- [%s] Market Data Request (snapshot) %s-%s"
+      addr symbol exchange ;
+    let instr = Instrument.find_exn symbol in
+    write_market_data_snapshot ?id addr w symbol instr ;
+    Log.debug log_dtc "-> [%s] Market Data Snapshot %s %s" addr symbol exchange
+  | Some `subscribe, Some id, Some symbol, Some exchange ->
+    Log.debug log_dtc "<- [%s] Market Data Request (subscribe) %ld %s-%s"
+      addr id symbol exchange ;
+    begin
+      match Int32.Table.find rev_subs id with
+      | Some symbol' when symbol <> symbol' ->
+        reject_market_data_request addr w ~id
+          "Already subscribed to %s-%s with a different id (was %ld)"
+          symbol exchange id
+      | _ ->
+        String.Table.set subs symbol id ;
+        Int32.Table.set rev_subs id symbol ;
+        let instr = Instrument.find_exn symbol in
+        write_market_data_snapshot ~id addr w symbol instr ;
+        Log.debug log_dtc "-> [%s] Market Data Snapshot %s %s" addr symbol exchange
+    end
+  | _ ->
+    reject_market_data_request addr w "Market Data Request: wrong request"
+
 (* let process addr w msg_cs scratchbuf = *)
 (*   let addr_str = Socket.Address.Inet.to_string addr in *)
 (*   (\* Erase scratchbuf by security. *\) *)
@@ -601,67 +710,7 @@ let security_definition_request addr w msg =
 (*     Log.debug log_dtc "-> [%s] EncodingResp" addr_str *)
 
 
-(*   | Some MarketDataRequest -> *)
-(*     let open MarketData in *)
-(*     let { Request.action; symbol_id; symbol; exchange } = Request.read msg_cs in *)
-(*     Log.debug log_dtc "<- [%s] MarketDataReq %s %s-%s" addr_str (RequestAction.show action) symbol exchange; *)
-(*     let { addr_str; subs; _ } = Option.value_exn client in *)
-(*     let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in *)
-(*     let reject k = Printf.ksprintf begin fun reason -> *)
-(*         Reject.write r_cs ~symbol_id "%s" reason; *)
-(*         Log.debug log_dtc "-> [%s] Market Data Reject: %s" addr_str reason; *)
-(*         Writer.write_cstruct w r_cs *)
-(*       end k *)
-(*     in *)
-(*     let snap_of_instr { instrObj; last_trade_price; last_trade_size; last_trade_ts; last_quote_ts } = *)
-(*       if action = Unsubscribe then String.Table.remove subs symbol; *)
-(*       if action = Subscribe then String.Table.set subs symbol symbol_id; *)
-(*       if Instrument.is_index symbol then *)
-(*         Snapshot.create *)
-(*           ~symbol_id:symbol_id *)
-(*           ?session_settlement_price:(RespObj.float instrObj "prevPrice24h") *)
-(*           ?last_trade_p:(RespObj.float instrObj "lastPrice") *)
-(*           ?last_trade_ts:(RespObj.string instrObj "timestamp" |> Option.map ~f:Time_ns.of_string) *)
-(*           () *)
-(*       else *)
-(*         (\* let open RespObj in *\) *)
-(*         let { Quote.bidPrice; bidSize; askPrice; askSize } = String.Table.find_exn quotes symbol in *)
-(*         let open RespObj in *)
-(*         Snapshot.create *)
-(*           ~symbol_id *)
-(*           ~session_settlement_price:Option.(value ~default:Float.max_finite_value (float instrObj "indicativeSettlePrice")) *)
-(*           ~session_h:Option.(value ~default:Float.max_finite_value @@ float instrObj "highPrice") *)
-(*           ~session_l:Option.(value ~default:Float.max_finite_value @@ float instrObj "lowPrice") *)
-(*           ~session_v:Option.(value_map (int64 instrObj "volume") ~default:Float.max_finite_value ~f:Int64.to_float) *)
-(*           ~open_interest:Option.(value_map (int64 instrObj "openInterest") ~default:0xffffffffl ~f:Int64.to_int32_exn) *)
-(*           ?bid:bidPrice *)
-(*           ?bid_qty:Option.(map bidSize ~f:Float.of_int) *)
-(*           ?ask:askPrice *)
-(*           ?ask_qty:Option.(map askSize ~f:Float.of_int) *)
-(*           ~last_trade_p:last_trade_price *)
-(*           ~last_trade_v:(Int.to_float last_trade_size) *)
-(*           ~last_trade_ts *)
-(*           ~bid_ask_ts:last_quote_ts *)
-(*           () *)
-(*     in *)
-(*     if !my_exchange <> exchange && not Instrument.(is_index symbol) then *)
-(*       reject "No such symbol %s-%s" symbol exchange *)
-(*     else begin match String.Table.find instruments symbol with *)
-(*       | None -> reject "No such symbol %s-%s" symbol exchange *)
-(*       | Some instr -> try *)
-(*           let snap = snap_of_instr instr in *)
-(*           let snap_cs = Cstruct.of_bigarray scratchbuf ~off:0 ~len:Snapshot.sizeof_cs in *)
-(*           Snapshot.to_cstruct snap_cs snap; *)
-(*           Log.debug log_dtc "-> [%s] %s" addr_str (Snapshot.show snap); *)
-(*           Writer.write_cstruct w snap_cs *)
-(*         with *)
-(*         | Not_found -> *)
-(*           Log.error log_dtc "market data request: no quote found for %s" symbol; *)
-(*           reject "No market data for symbol %s-%s" symbol exchange; *)
-(*         | exn -> *)
-(*           Log.error log_dtc "%s" Exn.(to_string exn); *)
-(*           reject "No market data for symbol %s-%s" symbol exchange; *)
-(*     end *)
+
 
 (*   | Some MarketDepthRequest -> *)
 (*     let open MarketDepth in *)
