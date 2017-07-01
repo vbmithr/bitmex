@@ -188,26 +188,33 @@ let log_bitmex = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[s
 let log_dtc = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 let log_ws = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 
-type book_entry = {
-  price: float;
-  size: int;
-}
+module Book = struct
+  type entry = {
+    price: float;
+    size: int;
+  }
 
-type books = {
-  bids: book_entry Int.Table.t;
-  asks: book_entry Int.Table.t;
-}
+  let mapify_ob =
+    let fold_f ~key:_ ~data:{ price; size } map =
+      Float.Map.update map price ~f:(function
+          | Some size' -> size + size'
+          | None -> size
+        )
+    in
+    Int.Table.fold ~init:Float.Map.empty ~f:fold_f
 
-let mapify_ob table =
-  let fold_f ~key:_ ~data:{ price; size } map =
-    Float.Map.update map price ~f:(function
-        | Some size' -> size + size'
-        | None -> size
-      )
-  in
-  Int.Table.fold table ~init:Float.Map.empty ~f:fold_f
+  let bids : entry Int.Table.t String.Table.t = String.Table.create ()
+  let asks : entry Int.Table.t String.Table.t = String.Table.create ()
 
-let orderbooks : books String.Table.t = String.Table.create ()
+  let get_bids symbol =
+    Option.value_map (String.Table.find bids symbol)
+      ~default:Float.Map.empty ~f:mapify_ob
+
+  let get_asks symbol =
+    Option.value_map (String.Table.find asks symbol)
+      ~default:Float.Map.empty ~f:mapify_ob
+end
+
 let quotes : Quote.t String.Table.t = String.Table.create ()
 
 let send_heartbeat { Connection.addr; w; dropped } ival =
@@ -682,6 +689,85 @@ let market_data_request addr w msg =
   | _ ->
     reject_market_data_request addr w "Market Data Request: wrong request"
 
+let reject_market_depth_request ?id addr w k =
+  Printf.ksprintf begin fun reject_text ->
+    let rej = DTC.default_market_depth_reject () in
+    rej.symbol_id <- id ;
+    rej.reject_text <- Some reject_text ;
+    Log.debug log_dtc "-> [%s] Market Depth Reject: %s" addr reject_text;
+    write_message w `market_depth_reject
+      DTC.gen_market_depth_reject rej
+  end k
+
+let write_market_depth_snapshot ?id addr w ~symbol ~exchange ~num_levels =
+  let bids = Book.get_bids symbol in
+  let asks = Book.get_asks symbol in
+  let snap = DTC.default_market_depth_snapshot_level () in
+  snap.symbol_id <- id ;
+  snap.side <- Some `at_bid ;
+  snap.is_last_message_in_batch <- Some false ;
+  Float.Map.fold_right bids ~init:1 ~f:begin fun ~key:price ~data:size lvl ->
+    snap.price <- Some price ;
+    snap.quantity <- Some (Float.of_int size) ;
+    snap.level <- Some (Int32.of_int_exn lvl) ;
+    snap.is_first_message_in_batch <- Some (lvl = 1) ;
+    write_message w `market_depth_snapshot_level DTC.gen_market_depth_snapshot_level snap ;
+    succ lvl
+  end |> ignore;
+  snap.side <- Some `at_ask ;
+  Float.Map.fold asks ~init:1 ~f:begin fun ~key:price ~data:size lvl ->
+    snap.price <- Some price ;
+    snap.quantity <- Some (Float.of_int size) ;
+    snap.level <- Some (Int32.of_int_exn lvl) ;
+    snap.is_first_message_in_batch <- Some (lvl = 1 && Float.Map.is_empty bids) ;
+    write_message w `market_depth_snapshot_level DTC.gen_market_depth_snapshot_level snap ;
+    succ lvl
+  end |> ignore;
+  snap.price <- None ;
+  snap.quantity <- None ;
+  snap.level <- None ;
+  snap.is_first_message_in_batch <- Some false ;
+  snap.is_last_message_in_batch <- Some true ;
+  write_message w `market_depth_snapshot_level DTC.gen_market_depth_snapshot_level snap
+
+let market_depth_request addr w msg =
+  let req = DTC.parse_market_depth_request msg in
+  let num_levels = Option.value_map req.num_levels ~default:50 ~f:Int32.to_int_exn in
+  let { Connection.subs_depth ; rev_subs_depth } = Connection.find_exn addr in
+  match req.request_action,
+        req.symbol_id,
+        req.symbol,
+        req.exchange
+  with
+  | _, id, _, Some exchange when exchange <> !my_exchange ->
+    reject_market_depth_request ?id addr w "No such exchange %s" exchange
+  | _, id, Some symbol, _ when not (Instrument.mem symbol) ->
+    reject_market_data_request ?id addr w "No such symbol %s" symbol
+  | Some `unsubscribe, Some id, _, _ ->
+    begin match Int32.Table.find rev_subs_depth id with
+    | None -> ()
+    | Some symbol -> String.Table.remove subs_depth symbol
+    end ;
+    Int32.Table.remove rev_subs_depth id
+  | Some `snapshot, id, Some symbol, Some exchange ->
+    write_market_depth_snapshot ?id addr w ~symbol ~exchange ~num_levels
+  | Some `subscribe, Some id, Some symbol, Some exchange ->
+    Log.debug log_dtc "<- [%s] Market Data Request %ld %s %s"
+      addr id symbol exchange ;
+    begin
+      match Int32.Table.find rev_subs_depth id with
+      | Some symbol' when symbol <> symbol' ->
+        reject_market_data_request addr w ~id
+          "Already subscribed to %s-%s with a different id (was %ld)"
+          symbol exchange id
+      | _ ->
+        String.Table.set subs_depth symbol id ;
+        Int32.Table.set rev_subs_depth id symbol ;
+        write_market_depth_snapshot ~id addr w ~symbol ~exchange ~num_levels
+    end
+  | _ ->
+    reject_market_data_request addr w "Market Data Request: wrong request"
+
 (* let process addr w msg_cs scratchbuf = *)
 (*   let addr_str = Socket.Address.Inet.to_string addr in *)
 (*   (\* Erase scratchbuf by security. *\) *)
@@ -712,62 +798,6 @@ let market_data_request addr w msg =
 
 
 
-(*   | Some MarketDepthRequest -> *)
-(*     let open MarketDepth in *)
-(*     let { Request.action; symbol_id; symbol; exchange; nb_levels } = Request.read msg_cs in *)
-(*     let { addr_str; subs_depth; _ } = Option.value_exn client in *)
-(*     Log.debug log_dtc "<- [%s] MarketDepthReq %s-%s %d" addr_str symbol exchange nb_levels; *)
-(*     let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in *)
-(*     let reject k = Printf.ksprintf begin fun msg -> *)
-(*         Reject.write r_cs ~symbol_id "%s" msg; *)
-(*         Log.debug log_dtc "-> [%s] MarketDepthRej: %s" addr_str msg; *)
-(*         Writer.write_cstruct w r_cs *)
-(*       end k *)
-(*     in *)
-(*     let accept { bids; asks } = *)
-(*       if action = Unsubscribe then String.Table.remove subs_depth symbol; *)
-(*       if action = Subscribe then String.Table.set subs_depth symbol symbol_id; *)
-(*       let snap_cs = Cstruct.of_bigarray scratchbuf ~off:0 ~len:Snapshot.sizeof_cs in *)
-(*       let bids = mapify_ob bids in *)
-(*       let asks = mapify_ob asks in *)
-(*       if Float.Map.(is_empty bids && is_empty asks) then begin *)
-(*         Snapshot.write snap_cs ~symbol_id ~p:0. ~v:0. ~lvl:0 ~first:true ~last:true; *)
-(*         Writer.write_cstruct w snap_cs *)
-(*       end *)
-(*       else begin *)
-(*         Float.Map.fold_right bids ~init:1 ~f:begin fun ~key:price ~data:size lvl -> *)
-(*           Snapshot.write snap_cs *)
-(*             ~symbol_id *)
-(*             ~side:`Buy ~p:price ~v:Float.(of_int size) ~lvl *)
-(*             ~first:(lvl = 1) ~last:false; *)
-(*           Writer.write_cstruct w snap_cs; *)
-(*           succ lvl *)
-(*         end |> ignore; *)
-(*         Float.Map.fold asks ~init:1 ~f:begin fun ~key:price ~data:size lvl -> *)
-(*           Snapshot.write snap_cs *)
-(*             ~symbol_id *)
-(*             ~side:`Sell ~p:price ~v:Float.(of_int size) ~lvl *)
-(*             ~first:(lvl = 1 && Float.Map.is_empty bids) ~last:false; *)
-(*           Writer.write_cstruct w snap_cs; *)
-(*           succ lvl *)
-(*         end |> ignore; *)
-(*         Snapshot.write snap_cs ~symbol_id ~p:0. ~v:0. ~lvl:0 ~first:false ~last:true; *)
-(*         Writer.write_cstruct w snap_cs *)
-(*       end *)
-(*     in *)
-(*     if Instrument.is_index symbol then *)
-(*       reject "%s is an index" symbol *)
-(*     else if !my_exchange <> exchange then *)
-(*       reject "No such symbol %s-%s" symbol exchange *)
-(*     else if action <> Unsubscribe && not @@ String.Table.mem instruments symbol then *)
-(*       reject "No such symbol %s-%s" symbol exchange *)
-(*     else begin match String.Table.find orderbooks symbol with *)
-(*       | None -> *)
-(*         Log.error log_dtc "MarketDepthReq: found no orderbooks for %s" symbol; *)
-(*         reject "Found no orderbook for symbol %s-%s" symbol exchange *)
-(*       | Some obs -> *)
-(*         accept obs *)
-(*     end *)
 
 (*   | Some HistoricalPriceDataRequest -> *)
 (*     let open HistoricalPriceData in *)
