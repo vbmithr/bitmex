@@ -177,8 +177,6 @@ module Instrument = struct
   let remove = String.Table.remove active
 end
 
-let bitmex_historical = ref ""
-
 let use_testnet = ref false
 let base_uri = ref @@ Uri.of_string "https://www.bitmex.com"
 let my_exchange = ref "BMEX"
@@ -251,7 +249,7 @@ let write_order_update ~nb_msgs ~msg_number w e =
     if execType = ordStatus then
       match execType with
       | "New" -> `order_status_open, `new_order_accepted
-      | "PartiallyFilled" -> `order_status_open, `order_filled_partially
+      | "PartiallyFilled" -> `order_status_partially_filled, `order_filled_partially
       | "Filled" -> `order_status_filled, `order_filled
       | "DoneForDay" -> `order_status_open, `general_order_update
       | "Canceled" -> `order_status_canceled, `order_canceled
@@ -266,7 +264,7 @@ let write_order_update ~nb_msgs ~msg_number w e =
       | "Restated", _ ->
         (match ordStatus with
          | "New" -> `order_status_open, `general_order_update
-         | "PartiallyFilled" -> `order_status_open, `general_order_update
+         | "PartiallyFilled" -> `order_status_partially_filled, `general_order_update
          | "Filled" -> `order_status_filled, `general_order_update
          | "DoneForDay" -> `order_status_open, `general_order_update
          | "Canceled" -> `order_status_canceled, `general_order_update
@@ -278,7 +276,7 @@ let write_order_update ~nb_msgs ~msg_number w e =
          | _ -> invalid_arg' execType ordStatus
         )
       | "Trade", "Filled" -> `order_status_filled, `order_filled
-      | "Trade", "PartiallyFilled" -> `order_status_filled, `order_filled_partially
+      | "Trade", "PartiallyFilled" -> `order_status_partially_filled, `order_filled_partially
       | "Replaced", "New" -> `order_status_open, `order_cancel_replace_complete
       | "TriggeredOrActivatedBySystem", "New" -> `order_status_open, `new_order_accepted
       | "Funding", _ -> raise Exit
@@ -305,8 +303,8 @@ let write_order_update ~nb_msgs ~msg_number w e =
     let ts =
       RespObj.(string e "transactTime" |> Option.map ~f:seconds_of_ts_string) in
     let p1, p2 = p1_p2_of_bitmex ~ord_type ~stopPx ~price in
-    u.total_num_messages <- Some nb_msgs ;
-    u.message_number <- Some msg_number ;
+    u.total_num_messages <- Some (Int32.of_int_exn nb_msgs) ;
+    u.message_number <- Some (Int32.of_int_exn msg_number) ;
     u.symbol <- Some RespObj.(string_exn e "symbol") ;
     u.exchange <- Some !my_exchange ;
     u.client_order_id <- Some RespObj.(string_exn e "clOrdID") ;
@@ -338,8 +336,8 @@ let write_position_update ?request_id ~nb_msgs ~msg_number w p =
   let avgEntryPrice = RespObj.float_exn p "avgEntryPrice" in
   let currentQty = RespObj.int_exn p "currentQty" in
   let u = DTC.default_position_update () in
-  u.total_number_messages <- Some nb_msgs ;
-  u.message_number <- Some msg_number ;
+  u.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
+  u.message_number <- Some (Int32.of_int_exn msg_number) ;
   u.request_id <- request_id ;
   u.symbol <- Some symbol ;
   u.exchange <- Some !my_exchange ;
@@ -440,7 +438,7 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position;
       | Insert | Partial ->
         IS.Table.set position ~key:(a, s) ~data:p;
         if RespObj.bool_exn p "isOpen" then begin
-          write_position_update ~nb_msgs:1l ~msg_number:1l w p ;
+          write_position_update ~nb_msgs:1 ~msg_number:1 w p ;
           Log.debug log_bitmex "<- [%s] position insert/partial" addr
         end
       | Update ->
@@ -452,7 +450,7 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position;
           IS.Table.set position ~key:(a, s) ~data:p;
           match old_p with
           | Some old_p when RespObj.bool_exn old_p "isOpen" ->
-            write_position_update ~nb_msgs:1l ~msg_number:1l w p ;
+            write_position_update ~nb_msgs:1 ~msg_number:1 w p ;
             Log.debug log_dtc "<- [%s] position update %s" addr s
           | _ -> ()
         end
@@ -465,7 +463,7 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position;
       match action with
       | WS.Response.Update.Insert ->
         Log.debug log_bitmex "<- [%s] exec %s" addr symbol;
-        if write_order_update ~nb_msgs:1l ~msg_number:1l w e then succ i else i
+        if write_order_update ~nb_msgs:1 ~msg_number:1 w e then succ i else i
       | _ -> i
     in
     let execs = List.map execs ~f:RespObj.of_json in
@@ -506,7 +504,7 @@ let accept_logon_request addr w req client stop_exec_inst trading =
   r.result_text <- Some result_text ;
   r.security_definitions_supported <- Some true ;
   r.market_data_supported <- Some true ;
-  r.historical_price_data_supported <- Some true ;
+  r.historical_price_data_supported <- Some false ;
   r.market_depth_is_supported <- Some true ;
   r.market_depth_updates_best_bid_and_ask <- Some true ;
   r.trading_is_supported <- Some trading_supported ;
@@ -768,6 +766,62 @@ let market_depth_request addr w msg =
   | _ ->
     reject_market_data_request addr w "Market Data Request: wrong request"
 
+let write_empty_order_update ?request_id w =
+  let u = DTC.default_order_update () in
+  u.total_num_messages <- Some 1l ;
+  u.message_number <- Some 1l ;
+  u.request_id <- request_id ;
+  u.no_orders <- Some true ;
+  u.order_update_reason <- Some `open_orders_request_response ;
+  write_message w `order_update DTC.gen_order_update u
+
+let open_orders_request addr w msg =
+  let req = DTC.parse_open_orders_request msg in
+  let { Connection.order } = Connection.find_exn addr in
+  Log.debug log_dtc "<- [%s] Open Orders Request" addr ;
+  let nb_msgs, open_orders = Uuid.Table.fold order  ~init:(0, [])
+      ~f:begin fun ~key:_ ~data ((nb_open_orders, os) as acc) ->
+        match RespObj.(string_exn data "ordStatus") with
+        | "New"
+        | "PartiallyFilled"
+        | "PendingCancel" -> (succ nb_open_orders, data :: os)
+        | _ -> acc
+      end
+  in
+  List.iteri open_orders ~f:begin fun msg_number o ->
+    ignore (write_order_update ~nb_msgs ~msg_number w o)
+  end ;
+  if nb_msgs = 0 then write_empty_order_update ?request_id:req.request_id w ;
+  Log.debug log_dtc "-> [%s] %d orders" addr nb_msgs
+
+let write_empty_position_update ?request_id w =
+  let u = DTC.default_position_update () in
+  u.total_number_messages <- Some 1l ;
+  u.message_number <- Some 1l ;
+  u.request_id <- request_id ;
+  u.no_positions <- Some true ;
+  u.unsolicited <- Some false ;
+  write_message w `position_update DTC.gen_position_update u
+
+let current_positions_request addr w msg =
+  let req = DTC.parse_current_positions_request msg in
+  let { Connection.position } = Connection.find_exn addr in
+  Log.debug log_dtc "<- [%s] Current Positions Request" addr ;
+  let nb_msgs, open_positions = IS.Table.fold position ~init:(0, [])
+      ~f:begin fun ~key:_ ~data ((nb_open_ps, open_ps) as acc) ->
+        if RespObj.bool_exn data "isOpen" then succ nb_open_ps, data :: open_ps
+        else acc
+      end
+  in
+  List.iteri open_positions ~f:begin fun i ->
+    write_position_update
+      ?request_id:req.request_id
+      ~nb_msgs
+      ~msg_number:(succ i) w
+  end;
+  if nb_msgs = 0 then write_empty_position_update ?request_id:req.request_id w ;
+  Log.debug log_dtc "-> [%s] %d positions" addr nb_msgs
+
 (* let process addr w msg_cs scratchbuf = *)
 (*   let addr_str = Socket.Address.Inet.to_string addr in *)
 (*   (\* Erase scratchbuf by security. *\) *)
@@ -797,119 +851,6 @@ let market_depth_request addr w msg =
 
 
 
-
-
-(*   | Some HistoricalPriceDataRequest -> *)
-(*     let open HistoricalPriceData in *)
-(*     let m = Request.read msg_cs in *)
-(*     let { addr_str; _ } = Option.value_exn client in *)
-(*     Log.debug log_dtc "<- [%s] HistPriceDataReq %s-%s" addr_str m.symbol m.exchange; *)
-(*     let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in *)
-(*     let reject k = Printf.ksprintf begin fun reason -> *)
-(*         Reject.write r_cs ~request_id:m.request_id "%s" reason; *)
-(*         Log.debug log_dtc "-> [%s] HistPriceDataRej" addr_str; *)
-(*         Writer.write_cstruct w r_cs; *)
-(*       end k *)
-(*     in *)
-(*     let accept () = *)
-(*       match String.Table.find instruments m.Request.symbol with *)
-(*        | None -> *)
-(*          reject "No such symbol %s-%s" m.symbol m.exchange; *)
-(*          Deferred.unit *)
-(*        | Some _ -> *)
-(*          let f addr te_r te_w = *)
-(*            Writer.write_cstruct te_w msg_cs; *)
-(*            let r_pipe = Reader.pipe te_r in *)
-(*            let w_pipe = Writer.pipe w in *)
-(*            Pipe.transfer_id r_pipe w_pipe >>| fun () -> *)
-(*            Log.debug log_dtc "-> [%s] <historical data>" addr_str *)
-(*          in *)
-(*          Monitor.try_with_or_error *)
-(*            ~name:"historical_with_connection" *)
-(*            (fun () -> Tcp.(with_connection (to_file !bitmex_historical) f)) >>| function *)
-(*          | Error err -> reject "Historical data server unavailable" *)
-(*          | Ok () -> () *)
-(*     in *)
-(*     if !my_exchange <> m.exchange && not Instrument.(is_index m.symbol) then *)
-(*       reject "No such symbol %s-%s" m.symbol m.exchange *)
-(*     else don't_wait_for @@ accept () *)
-
-(*   | Some OpenOrdersRequest -> *)
-(*     let open Trading.Order.Open in *)
-(*     let m = Request.read msg_cs in *)
-(*     let { addr_str; order; _ } = Option.value_exn client in *)
-(*     Log.debug log_dtc "<- [%s] %s" addr_str (Request.show m); *)
-(*     let nb_open_orders, open_orders = Uuid.Table.fold order *)
-(*         ~init:(0, []) *)
-(*         ~f:begin fun ~key:_ ~data ((nb_open_orders, os) as acc) -> *)
-(*           match RespObj.(string_exn data "ordStatus") with *)
-(*           | "New" | "PartiallyFilled" | "PendingCancel" -> *)
-(*             (succ nb_open_orders, data :: os) *)
-(*           | _ -> acc *)
-(*         end *)
-(*     in *)
-(*     let open Trading.Order.Update in *)
-(*     let update_cs = Cstruct.of_bigarray ~off:0 ~len:sizeof_cs scratchbuf in *)
-(*     let send_order_update i data = *)
-(*       let ord_type = ord_type_of_string RespObj.(string_exn data "ordType") in *)
-(*       let price = RespObj.(float_or_null_exn ~default:Float.max_finite_value data "price") in *)
-(*       let stopPx = RespObj.(float_or_null_exn ~default:Float.max_finite_value data "stopPx") in *)
-(*       let p1, p2 = p1_p2_of_bitmex ~ord_type ~stopPx ~price in *)
-(*       write *)
-(*         ~nb_msgs:nb_open_orders *)
-(*         ~msg_number:(succ i) *)
-(*         ~status:`Open (\* FIXME: PartiallyFilled ?? *\) *)
-(*         ~reason:UpdateReason.Open_orders_request_response *)
-(*         ~request_id:m.Request.id *)
-(*         ~symbol:RespObj.(string_exn data "symbol") *)
-(*         ~exchange:!my_exchange *)
-(*         ~cli_ord_id:RespObj.(string_exn data "clOrdID") *)
-(*         ~srv_ord_id:RespObj.(string_exn data "orderID" |> b64_of_uuid) *)
-(*         ~xch_ord_id:RespObj.(string_exn data "orderID" |> b64_of_uuid) *)
-(*         ~ord_type:(ord_type_of_string RespObj.(string_exn data "ordType")) *)
-(*         ?side:(RespObj.string_exn data "side" |> side_of_bmex) *)
-(*         ?p1 *)
-(*         ?p2 *)
-(*         ~order_qty:RespObj.(int64_exn data "orderQty" |> Int64.to_float) *)
-(*         ~filled_qty:RespObj.(int64_exn data "cumQty" |> Int64.to_float) *)
-(*         ~remaining_qty:RespObj.(int64_exn data "leavesQty" |> Int64.to_float) *)
-(*         ~tif:(tif_of_string RespObj.(string_exn data "timeInForce")) *)
-(*         ~trade_account:RespObj.(int64_exn data "account" |> Int64.to_string) *)
-(*         ~free_form_text:RespObj.(string_exn data "text") *)
-(*         update_cs; *)
-(*       Writer.write_cstruct w update_cs; *)
-(*     in *)
-(*     List.iteri open_orders ~f:send_order_update; *)
-(*     if nb_open_orders = 0 then begin *)
-(*       write ~nb_msgs:1 ~msg_number:1 ~request_id:m.Request.id *)
-(*         ~reason:UpdateReason.Open_orders_request_response ~no_orders:true update_cs; *)
-(*       Writer.write_cstruct w update_cs *)
-(*     end; *)
-(*     Log.debug log_dtc "-> [%s] %d orders" addr_str nb_open_orders; *)
-
-(*   | Some CurrentPositionsRequest -> *)
-(*     let open Trading.Position in *)
-(*     let m = Request.read msg_cs in *)
-(*     let update_cs = Cstruct.of_bigarray ~off:0 ~len:Update.sizeof_cs scratchbuf in *)
-(*     let { addr_str; position; _ } = Option.value_exn client in *)
-(*     Log.debug log_dtc "<- [%s] PosReq (%s)" addr_str m.Request.trade_account; *)
-(*     let nb_open_positions, open_positions = IS.Table.fold position *)
-(*         ~init:(0, []) *)
-(*         ~f:begin fun ~key:_ ~data ((nb_open_ps, open_ps) as acc) -> *)
-(*           if RespObj.bool_exn data "isOpen" then *)
-(*             succ nb_open_ps, data :: open_ps *)
-(*           else *)
-(*             acc *)
-(*         end *)
-(*     in *)
-(*     List.iteri open_positions ~f:begin fun i -> *)
-(*       write_position_update ~request_id:m.id ~nb_msgs:nb_open_positions ~msg_number:(succ i) w update_cs *)
-(*     end; *)
-(*     if nb_open_positions = 0 then begin *)
-(*       Update.write ~nb_msgs:1 ~msg_number:1 ~request_id:m.Request.id ~no_positions:true update_cs; *)
-(*       Writer.write_cstruct w update_cs *)
-(*     end; *)
-(*     Log.debug log_dtc "-> [%s] %d positions" addr_str nb_open_positions; *)
 
 (*   | Some HistoricalOrderFillsRequest -> *)
 (*     let open Trading.Order.Fills in *)
@@ -1861,8 +1802,7 @@ let bitmex_ws ~instrs_initialized ~orderbook_initialized ~quotes_initialized =
     (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
     (fun exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn)
 
-let main tls testnet port daemon sockfile pidfile logfile loglevel ll_ws ll_dtc ll_bitmex crt_path key_path =
-  let sockfile = if testnet then add_suffix sockfile "_testnet" else sockfile in
+let main tls testnet port daemon pidfile logfile loglevel ll_ws ll_dtc ll_bitmex crt_path key_path =
   let pidfile = if testnet then add_suffix pidfile "_testnet" else pidfile in
   let logfile = if testnet then add_suffix logfile "_testnet" else logfile in
   let run server =
@@ -1884,7 +1824,6 @@ let main tls testnet port daemon sockfile pidfile logfile loglevel ll_ws ll_dtc 
     base_uri := Uri.of_string "https://testnet.bitmex.com";
     my_exchange := "BMEXT"
   end;
-  bitmex_historical := sockfile;
 
   Log.set_level log_dtc @@ loglevel_of_int @@ max loglevel ll_dtc;
   Log.set_level log_bitmex @@ loglevel_of_int @@ max loglevel ll_bitmex;
@@ -1910,7 +1849,6 @@ let command =
     +> flag "-testnet" no_arg ~doc:" Use testnet"
     +> flag "-port" (optional_with_default 5567 int) ~doc:"int TCP port to use (5567)"
     +> flag "-daemon" no_arg ~doc:" Run as a daemon"
-    +> flag "-sockfile" (optional_with_default "run/bitmex.sock" string) ~doc:"filename UNIX sock to use (run/bitmex.sock)"
     +> flag "-pidfile" (optional_with_default "run/bitmex.pid" string) ~doc:"filename Path of the pid file (run/bitmex.pid)"
     +> flag "-logfile" (optional_with_default "log/bitmex.log" string) ~doc:"filename Path of the log file (log/bitmex.log)"
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 global loglevel"
