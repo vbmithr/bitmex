@@ -346,10 +346,12 @@ let write_position_update ?request_id ~nb_msgs ~msg_number w p =
   u.quantity <- Some (Int.to_float currentQty) ;
   write_message w `position_update DTC.gen_position_update u
 
-let write_balance_update ~msg_number ~nb_msgs ~unsolicited w m =
+let write_balance_update ?request_id ~msg_number ~nb_msgs w m =
   let u = DTC.default_account_balance_update () in
-  u.total_number_messages <- Some nb_msgs ;
-  u.message_number <- Some msg_number ;
+  u.request_id <- request_id ;
+  u.unsolicited <- Some (Option.is_none request_id) ;
+  u.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
+  u.message_number <- Some (Int32.of_int_exn msg_number) ;
   u.account_currency <- Some "mXBT" ;
   u.cash_balance <- Some RespObj.(Int64.(to_float @@ int64_exn m "walletBalance") /. 1e5) ;
   u.balance_available_for_new_positions <-
@@ -412,7 +414,7 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position;
       | Partial ->
         IS.Table.set margin ~key:(a, c) ~data:m;
         Log.debug log_bitmex "<- [%s] margin insert/partial" addr;
-        write_balance_update ~unsolicited:true ~msg_number:1l ~nb_msgs:1l w m
+        write_balance_update ~msg_number:1 ~nb_msgs:1 w m
       | Update ->
         if Ivar.is_full margin_partial_done then begin
           let m = match IS.Table.find margin (a, c) with
@@ -420,7 +422,7 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position;
             | Some old_m -> RespObj.merge old_m m
           in
           IS.Table.set margin ~key:(a, c) ~data:m;
-          write_balance_update ~unsolicited:true ~msg_number:1l ~nb_msgs:1l w m ;
+          write_balance_update ~msg_number:1 ~nb_msgs:1 w m ;
           Log.debug log_bitmex "<- [%s] margin update" addr
         end
     end;
@@ -822,6 +824,114 @@ let current_positions_request addr w msg =
   if nb_msgs = 0 then write_empty_position_update ?request_id:req.request_id w ;
   Log.debug log_dtc "-> [%s] %d positions" addr nb_msgs
 
+let send_historical_order_fills_response ?request_id addr w = function
+  | `List orders ->
+    let resp = DTC.default_historical_order_fill_response () in
+    let nb_msgs = List.length orders in
+    resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
+    resp.request_id <- request_id ;
+    List.iteri orders ~f:begin fun i o ->
+      let o = RespObj.of_json o in
+      let side = match (RespObj.string_exn o "side" |> Side.of_string) with
+        | None -> `buy_sell_unset
+        | Some `Buy -> `buy
+        | Some `Sell -> `sell in
+      resp.message_number <- Some Int32.(succ @@ of_int_exn i) ;
+      resp.symbol <- Some RespObj.(string_exn o "symbol") ;
+      resp.exchange <- Some !my_exchange ;
+      resp.server_order_id <- Some RespObj.(string_exn o "orderID") ;
+      resp.price <- Some RespObj.(float_exn o "avgPx") ;
+      resp.quantity <- Some Float.(of_int64 RespObj.(int64_exn o "orderQty")) ;
+      resp.date_time <-
+        (RespObj.string o "transactTime" |> Option.map ~f:seconds_of_ts_string) ;
+      resp.buy_sell <- Some side ;
+      resp.unique_execution_id <- Some RespObj.(string_exn o "execID") ;
+      write_message w `historical_order_fill_response
+        DTC.gen_historical_order_fill_response resp
+    end ;
+    Log.debug log_dtc "-> [%s] Historical Order Fills Response %d" addr nb_msgs
+  | #Yojson.Safe.json ->
+    invalid_arg "bitmex historical order fills response"
+
+let historical_order_fills_request addr w msg =
+  let req = DTC.parse_historical_order_fills_request msg in
+  let { Connection.key ; secret } = Connection.find_exn addr in
+  Log.debug log_dtc "<- [%s] Historical Order Fills Request" addr ;
+  let filter = `Assoc begin List.filter_opt [
+      Option.map req.server_order_id ~f:(fun id -> ("orderID", `String id)) ;
+      Some ("execType", `String "Trade")
+    ] end
+  in
+  don't_wait_for begin
+    REST.trade_history
+      ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
+    | Ok body ->
+      send_historical_order_fills_response ?request_id:req.request_id addr w body
+    | Error err ->
+      (* TODO: reject on error *)
+      Log.error log_bitmex "%s" @@ Error.to_string_hum err
+  end
+
+let trade_accounts_request addr w msg =
+  let req = DTC.parse_trade_accounts_request msg in
+  let { Connection.margin } = Connection.find_exn addr in
+  Log.debug log_dtc "<- [%s] Trade Accounts Request" addr ;
+  let account, _ = List.hd_exn @@ IS.Table.keys margin in
+  let resp = DTC.default_trade_account_response () in
+  resp.request_id <- req.request_id ;
+  resp.total_number_messages <- Some 1l ;
+  resp.message_number <- Some 1l ;
+  resp.trade_account <- Some Int.(to_string account) ;
+  write_message w `trade_account_response  DTC.gen_trade_account_response resp ;
+  Log.debug log_dtc "-> [%s] Trade Account Response %d" addr account
+
+let write_account_balance_reject ?request_id addr w k =
+  let rej = DTC.default_account_balance_reject () in
+  rej.request_id <- request_id ;
+  Printf.ksprintf begin fun reject_text ->
+    rej.reject_text <- Some reject_text ;
+    write_message w `account_balance_reject  DTC.gen_account_balance_reject rej ;
+    Log.debug log_dtc "-> [%s] Account Balance Reject" addr ;
+  end k
+
+let write_no_balances ?trade_account ?request_id addr w =
+  let resp = DTC.default_account_balance_update () in
+  resp.request_id <- request_id ;
+  resp.trade_account <- trade_account ;
+  resp.total_number_messages <- Some 1l ;
+  resp.message_number <- Some 1l ;
+  resp.no_account_balances <- Some true ;
+  resp.unsolicited <- Some false ;
+  write_message w `account_balance_update  DTC.gen_account_balance_update resp ;
+  Log.debug log_dtc "-> [%s] no account balance" addr
+
+let write_account_balance_update ?request_id ~msg_number ~nb_msgs addr w account_id obj =
+  write_balance_update ?request_id ~msg_number ~nb_msgs w obj ;
+  Log.debug log_dtc "-> [%s] account balance %d" addr account_id
+
+let account_balance_request addr w msg =
+  let req = DTC.parse_account_balance_request msg in
+  let { Connection.addr ; margin } = Connection.find_exn addr in
+  Log.debug log_dtc "<- [%s] Account Balance Request" addr ;
+  let nb_msgs = IS.Table.length margin in
+  if nb_msgs = 0 then write_no_balances ?request_id:req.request_id addr w
+  else match req.trade_account with
+    | None ->
+      IS.Table.fold margin ~init:1~f:begin fun ~key:(account_id, currency) ~data msg_number ->
+        write_account_balance_update ~msg_number ~nb_msgs addr w account_id data ;
+        succ msg_number
+      end |> ignore
+    | Some trade_account ->
+      match IS.Table.find margin (Int.of_string trade_account, "XBt") with
+      | Some obj ->
+        write_account_balance_update
+          ~msg_number:1 ~nb_msgs:1 addr w Int.(of_string trade_account) obj
+      | None ->
+        write_no_balances ~trade_account ?request_id:req.request_id addr w
+      | exception _ ->
+        write_account_balance_reject ?request_id:req.request_id addr w
+          "Invalid trade account %s" trade_account
+
 (* let process addr w msg_cs scratchbuf = *)
 (*   let addr_str = Socket.Address.Inet.to_string addr in *)
 (*   (\* Erase scratchbuf by security. *\) *)
@@ -848,109 +958,6 @@ let current_positions_request addr w msg =
 (*     Response.write response_cs; *)
 (*     Writer.write_cstruct w response_cs; *)
 (*     Log.debug log_dtc "-> [%s] EncodingResp" addr_str *)
-
-
-
-
-(*   | Some HistoricalOrderFillsRequest -> *)
-(*     let open Trading.Order.Fills in *)
-(*     let m = Request.read msg_cs in *)
-(*     let response_cs = Cstruct.of_bigarray scratchbuf ~len:Response.sizeof_cs in *)
-(*     let { addr_str; key; secret; _ } = Option.value_exn client in *)
-(*     Log.debug log_dtc "<- [%s] HistFillsReq" addr_str; *)
-(*     let uri = Uri.with_path !base_uri "/api/v1/execution/tradeHistory" in *)
-(*     let req = List.filter_opt [ *)
-(*         if m.Request.srv_order_id <> "" then Some ("orderID", `String m.Request.srv_order_id) else None; *)
-(*         Some ("execType", `String "Trade") *)
-(*       ] *)
-(*     in *)
-(*     let uri = Uri.with_query' uri ["filter", Yojson.Safe.to_string @@ `Assoc req] in *)
-(*     let process_body = function *)
-(*     | `List orders -> *)
-(*       let nb_msgs = List.length orders in *)
-(*       List.iteri orders ~f:begin fun i o -> *)
-(*         let o = RespObj.of_json o in *)
-(*         Response.write *)
-(*           ~nb_msgs *)
-(*           ~msg_number:(succ i) *)
-(*           ~request_id:m.Request.id *)
-(*           ~symbol:RespObj.(string_exn o "symbol") *)
-(*           ~exchange:!my_exchange *)
-(*           ~srv_order_id:RespObj.(string_exn o "orderID" |> b64_of_uuid) *)
-(*           ~p:RespObj.(float_exn o "avgPx") *)
-(*           ~v:Float.(of_int64 RespObj.(int64_exn o "orderQty")) *)
-(*           ?ts:(RespObj.string o "transactTime" |> Option.map ~f:Time_ns.of_string) *)
-(*           ?side:(RespObj.string_exn o "side" |> side_of_bmex) *)
-(*           ~exec_id:RespObj.(string_exn o "execID" |> b64_of_uuid) *)
-(*           response_cs; *)
-(*         Writer.write_cstruct w response_cs *)
-(*       end; *)
-(*       Log.debug log_dtc "-> [%s] HistOrdFillsResp %d" addr_str nb_msgs *)
-(*     | #Yojson.Safe.json -> invalid_arg "bitmex historical order fills response" *)
-(*     in *)
-(*     let get_fills_and_reply () = *)
-(*       Rest.call ~name:"execution" ~f:begin fun uri -> *)
-(*         Client.get ~headers:(Rest.mk_headers ~key ~secret `GET uri) uri *)
-(*       end uri >>| function *)
-(*       | Ok body -> process_body body *)
-(*       | Error err -> *)
-(*         (\* TODO: reject on error *\) *)
-(*         Log.error log_bitmex "%s" @@ Error.to_string_hum err *)
-(*     in don't_wait_for @@ get_fills_and_reply () (\* TODO: reject on error *\) *)
-
-(*   | Some TradeAccountsRequest -> *)
-(*     let open Account.List in *)
-(*     let m = Request.read msg_cs in *)
-(*     let { addr_str; margin; _ } = Option.value_exn client in *)
-(*     Log.debug log_dtc "<- [%s] TradeAccountsReq" addr_str; *)
-(*     let response_cs = *)
-(*       Cstruct.of_bigarray ~off:0 ~len:Response.sizeof_cs scratchbuf in *)
-(*     let account, _ = List.hd_exn @@ IS.Table.keys margin in *)
-(*     Response.write ~request_id:m.Request.id ~msg_number:1 ~nb_msgs:1 *)
-(*       ~trade_account:Int.(to_string account) response_cs; *)
-(*     Writer.write_cstruct w response_cs; *)
-(*     Log.debug log_dtc "-> [%s] TradeAccountResp %d" addr_str account *)
-
-(*   | Some AccountBalanceRequest -> *)
-(*     let open Account.Balance in *)
-(*     let m = Request.read msg_cs in *)
-(*     let { addr_str; margin; _ } = Option.value_exn client in *)
-(*     let r_cs = Cstruct.of_bigarray ~off:0 ~len:Reject.sizeof_cs scratchbuf in *)
-(*     let update_cs = Cstruct.of_bigarray ~off:0 ~len:Update.sizeof_cs scratchbuf in *)
-(*     let reject k = Printf.ksprintf begin fun reason -> *)
-(*         Reject.write r_cs ~request_id:m.id "%s" reason; *)
-(*         Writer.write_cstruct w r_cs; *)
-(*         Log.debug log_dtc "-> [%s] AccountBalanceRej" addr_str; *)
-(*       end k *)
-(*     in *)
-(*     let write_no_balances request_id = *)
-(*       Account.Balance.Update.write ~request_id ~nb_msgs:1 ~msg_number:1 ~no_account_balance:true update_cs; *)
-(*       Writer.write_cstruct w update_cs; *)
-(*       Log.debug log_dtc "-> [%s] no account balance" addr_str *)
-(*     in *)
-(*     let update ~msg_number ~nb_msgs account_id obj = *)
-(*       write_balance_update ~unsolicited:false ~msg_number ~nb_msgs update_cs obj; *)
-(*       Writer.write_cstruct w update_cs; *)
-(*       Log.debug log_dtc "-> [%s] account balance %d" addr_str account_id *)
-(*     in *)
-(*     Log.debug log_dtc "<- [%s] AccountBalanceReq (%s)" *)
-(*       addr_str m.Request.trade_account; *)
-(*     let nb_msgs = IS.Table.length margin in *)
-(*     if nb_msgs = 0 then *)
-(*       write_no_balances m.id *)
-(*     else if m.Request.trade_account = "" then *)
-(*       ignore @@ IS.Table.fold margin ~init:1 *)
-(*         ~f:(fun ~key:(account_id, currency) ~data msg_number -> *)
-(*             update ~msg_number ~nb_msgs account_id data; *)
-(*             succ msg_number *)
-(*           ) *)
-(*     else begin *)
-(*       match IS.Table.find margin (Int.of_string m.Request.trade_account, "XBt") *)
-(*       with *)
-(*       | Some obj -> update ~msg_number:1 ~nb_msgs:1 Int.(of_string m.Request.trade_account) obj *)
-(*       | None -> write_no_balances m.id *)
-(*       | exception _ -> reject "Invalid trade account %s" m.Request.trade_account *)
-(*     end *)
 
 (*   | Some SubmitNewSingleOrder -> *)
 (*     let module S = Trading.Order.Submit in *)
@@ -1443,8 +1450,8 @@ let dtcserver ~server ~port =
             | `market_depth_request -> market_depth_request addr w msg
             | `open_orders_request -> open_orders_request addr w msg
             | `current_positions_request -> current_positions_request addr w msg
-            | `historical_order_fills_request -> historical_order_fills addr w msg
-            | `trade_accounts_request -> trade_account_request addr w msg
+            | `historical_order_fills_request -> historical_order_fills_request addr w msg
+            | `trade_accounts_request -> trade_accounts_request addr w msg
             | `account_balance_request -> account_balance_request addr w msg
             | `submit_new_single_order -> submit_new_single_order addr w msg
             | `cancel_order -> cancel_order addr w msg
