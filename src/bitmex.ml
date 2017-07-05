@@ -296,13 +296,13 @@ let write_order_update ~nb_msgs ~msg_number w e =
       | None -> `buy_sell_unset
       | Some `Buy -> `buy
       | Some `Sell -> `sell in
-    let ord_type =
+    let ordType =
       (OrderType.of_string RespObj.(string_exn e "ordType")) in
-    let tif =
+    let timeInForce =
       (TimeInForce.of_string RespObj.(string_exn e "timeInForce")) in
     let ts =
       RespObj.(string e "transactTime" |> Option.map ~f:seconds_of_ts_string) in
-    let p1, p2 = p1_p2_of_bitmex ~ord_type ~stopPx ~price in
+    let p1, p2 = OrderType.to_p1_p2 ~stopPx ~price ordType in
     u.total_num_messages <- Some (Int32.of_int_exn nb_msgs) ;
     u.message_number <- Some (Int32.of_int_exn msg_number) ;
     u.symbol <- Some RespObj.(string_exn e "symbol") ;
@@ -310,13 +310,13 @@ let write_order_update ~nb_msgs ~msg_number w e =
     u.client_order_id <- Some RespObj.(string_exn e "clOrdID") ;
     u.server_order_id <- Some RespObj.(string_exn e "orderID") ;
     u.exchange_order_id <- Some RespObj.(string_exn e "orderID") ;
-    u.order_type <- Some (ord_type :> DTC.order_type_enum) ;
+    u.order_type <- Some ordType ;
     u.order_status <- Some status ;
     u.order_update_reason <- Some reason ;
     u.buy_sell <- Some side ;
     u.price1 <- p1 ;
     u.price2 <- p2 ;
-    u.time_in_force <- Some (tif :> DTC.time_in_force_enum) ;
+    u.time_in_force <- Some timeInForce ;
     u.order_quantity <- Some RespObj.(int64_exn e "orderQty" |> Int64.to_float) ;
     u.filled_quantity <- Some RespObj.(int64_exn e "cumQty" |> Int64.to_float) ;
     u.remaining_quantity <- Some RespObj.(int64_exn e "leavesQty" |> Int64.to_float) ;
@@ -546,9 +546,9 @@ let logon_request addr w msg =
   Log.debug log_dtc "<- [%s] Logon Request" addr ;
   let stop_exec_inst =
     match req.integer_1 with
-    | Some 1l -> `LastPrice
-    | Some 2l -> `IndexPrice
-    | _ -> `MarkPrice in
+    | Some 1l -> ExecInst.LastPrice
+    | Some 2l -> IndexPrice
+    | _ -> MarkPrice in
   begin
     match req.username, req.password with
     | Some apikey, Some secret ->
@@ -911,7 +911,7 @@ let write_account_balance_update ?request_id ~msg_number ~nb_msgs addr w account
 
 let account_balance_request addr w msg =
   let req = DTC.parse_account_balance_request msg in
-  let { Connection.addr ; margin } = Connection.find_exn addr in
+  let { Connection.margin } = Connection.find_exn addr in
   Log.debug log_dtc "<- [%s] Account Balance Request" addr ;
   let nb_msgs = IS.Table.length margin in
   if nb_msgs = 0 then write_no_balances ?request_id:req.request_id addr w
@@ -931,6 +931,109 @@ let account_balance_request addr w msg =
       | exception _ ->
         write_account_balance_reject ?request_id:req.request_id addr w
           "Invalid trade account %s" trade_account
+
+let reject_order (req : DTC.Submit_new_single_order.t) w k =
+  let rej = DTC.default_order_update () in
+  rej.total_num_messages <- Some 1l ;
+  rej.message_number <- Some 1l ;
+  rej.trade_account <- req.trade_account ;
+  rej.symbol <- req.symbol ;
+  rej.exchange <- req.exchange ;
+  rej.order_status <- Some `order_status_rejected ;
+  rej.order_update_reason <- Some `new_order_rejected ;
+  rej.client_order_id <- req.client_order_id ;
+  rej.order_type <- req.order_type ;
+  rej.buy_sell <- req.buy_sell ;
+  rej.price1 <- req.price1 ;
+  rej.price2 <- req.price2 ;
+  rej.order_quantity <- req.quantity ;
+  rej.time_in_force <- req.time_in_force ;
+  rej.good_till_date_time <- req.good_till_date_time ;
+  rej.free_form_text <- req.free_form_text ;
+  Printf.ksprintf begin fun info_text ->
+    rej.info_text <- Some info_text ;
+    write_message w `order_update DTC.gen_order_update rej ;
+  end k
+
+let update_order (req : DTC.Submit_new_single_order.t) w ~status ~reason k =
+  let rej = DTC.default_order_update () in
+  rej.total_num_messages <- Some 1l ;
+  rej.message_number <- Some 1l ;
+  rej.trade_account <- req.trade_account ;
+  rej.order_status <- Some status ;
+  rej.order_update_reason <- Some reason ;
+  rej.client_order_id <- req.client_order_id ;
+  rej.order_type <- req.order_type ;
+  rej.buy_sell <- req.buy_sell ;
+  rej.open_or_close <- req.open_or_close ;
+  rej.price1 <- req.price1 ;
+  rej.price2 <- req.price2 ;
+  rej.order_quantity <- req.quantity ;
+  rej.time_in_force <- req.time_in_force ;
+  rej.good_till_date_time <- req.good_till_date_time ;
+  rej.free_form_text <- req.free_form_text ;
+  Printf.ksprintf begin fun info_text ->
+    rej.info_text <- Some info_text ;
+    write_message w `order_update DTC.gen_order_update rej ;
+  end k
+
+let submit_order w ~key ~secret (req : DTC.Submit_new_single_order.t) stop_exec_inst =
+  let symbol = Option.value_exn ~message:"symbol is undefined" req.symbol in
+  let qty = Option.value_exn ~message:"qty is undefined" req.quantity in
+  let qty = Int.of_float @@ match req.buy_sell with
+    | Some `sell -> Float.neg qty
+    | _ -> qty in
+  let ordType = Option.value ~default:`order_type_unset req.order_type in
+  let timeInForce = Option.value ~default:`tif_unset req.time_in_force in
+  let price, stopPx =
+    OrderType.to_price_stopPx ?p1:req.price1 ?p2:req.price2 ordType in
+  let displayQty, execInst = match timeInForce with
+    | `tif_all_or_none -> Some 0, [ExecInst.AllOrNone ; stop_exec_inst]
+    | #DTC.time_in_force_enum -> None, [stop_exec_inst] in
+  let order =
+    REST.Order.create
+      ?displayQty
+      ~execInst
+      ?price
+      ?stopPx
+      ?clOrdID:req.client_order_id
+      ?text:req.free_form_text
+      ~symbol ~qty ~ordType ~timeInForce ()
+  in
+  don't_wait_for begin
+    REST.Order.submit_bulk
+      ~log:log_bitmex
+      ~testnet:!use_testnet ~key ~secret [order] >>| function
+    | Ok _body -> ()
+    | Error err ->
+      let err_str = Error.to_string_hum err in
+      reject_order req w "%s" err_str ;
+      Log.error log_bitmex "%s" err_str
+  end
+
+let submit_new_single_order addr w msg =
+  let req = DTC.default_submit_new_single_order () in
+  let { Connection.key; secret;
+        current_parent; stop_exec_inst } as conn = Connection.find_exn addr in
+  Log.debug log_dtc "<- [%s] Submit New Single Order" addr ;
+  if req.time_in_force = Some `tif_good_till_date_time then begin
+    reject_order req w "BitMEX does not support TIF Good till datetime"
+  end
+  else if Option.is_some current_parent then begin
+    let current_parent = Option.(value_exn current_parent) in
+    conn.current_parent <- None ;
+    reject_order current_parent w "Next received order was not an OCO" ;
+    reject_order req w "Previous received order was also a parent and the current order is not an OCO"
+  end
+  else if req.is_parent_order = Some true then begin
+    Connection.set_parent_order conn req ;
+    update_order req w
+      ~status:`order_status_pending_open
+      ~reason:`general_order_update
+      "parent order stored" ;
+    Log.debug log_dtc "Stored parent order"
+  end
+  else submit_order w ~key ~secret req stop_exec_inst
 
 (* let process addr w msg_cs scratchbuf = *)
 (*   let addr_str = Socket.Address.Inet.to_string addr in *)
@@ -958,83 +1061,6 @@ let account_balance_request addr w msg =
 (*     Response.write response_cs; *)
 (*     Writer.write_cstruct w response_cs; *)
 (*     Log.debug log_dtc "-> [%s] EncodingResp" addr_str *)
-
-(*   | Some SubmitNewSingleOrder -> *)
-(*     let module S = Trading.Order.Submit in *)
-(*     let module U = Trading.Order.Update in *)
-(*     let m = S.read msg_cs in *)
-(*     let { addr_str; key; secret; current_parent; stop_exec_inst } as c = Option.value_exn client in *)
-(*     let order_update_cs = Cstruct.of_bigarray ~off:0 ~len:U.sizeof_cs scratchbuf in *)
-(*     Log.debug log_dtc "<- [%s] %s" addr_str (S.show m); *)
-(*     let accept_exn () = *)
-(*       let uri = Uri.with_path !base_uri "/api/v1/order" in *)
-(*       let qty = match Option.value_exn ~message:"side is undefined" m.S.side with *)
-(*         | `Buy -> m.S.qty *)
-(*         | `Sell -> Float.neg m.S.qty *)
-(*       in *)
-(*       let tif = Option.value_exn ~message:"tif is undefined" m.tif in *)
-(*       let ordType = Option.value_exn ~message:"ordType is undefined" m.ord_type in *)
-(*       let tif = match tif with *)
-(*       | `Good_till_date_time -> invalid_arg "good_till_date_time" *)
-(*       | #time_in_force as tif -> tif in *)
-(*       let body = *)
-(*         ["symbol", `String m.S.symbol; *)
-(*          "orderQty", `Float qty; *)
-(*          "timeInForce", `String (string_of_tif tif); *)
-(*          "ordType", `String (string_of_ord_type ordType); *)
-(*          "clOrdID", `String m.S.cli_ord_id; *)
-(*          "text", `String m.text; *)
-(*         ] *)
-(*         @ price_fields_of_dtc ordType ~p1:m.S.p1 ~p2:m.S.p2 *)
-(*         @ execInst_of_dtc ordType tif stop_exec_inst *)
-(*       in *)
-(*       let body_str = Yojson.Safe.to_string @@ `Assoc body in *)
-(*       let body = Body.of_string body_str in *)
-(*       Log.debug log_bitmex "-> %s" body_str; *)
-(*       Rest.call ~name:"submit" ~f:begin fun uri -> *)
-(*         Client.post ~chunked:false ~body *)
-(*           ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `POST uri) uri *)
-(*       end uri >>| function *)
-(*       | Ok _body -> () *)
-(*       | Error err -> *)
-(*         let err_str = Error.to_string_hum err in *)
-(*         Dtc_util.Trading.Order.Submit.reject order_update_cs m "%s" err_str; *)
-(*         Writer.write_cstruct w order_update_cs; *)
-(*         Log.error log_bitmex "%s" err_str *)
-(*     in *)
-(*     if !my_exchange <> m.S.exchange then begin *)
-(*       Dtc_util.Trading.Order.Submit.reject order_update_cs m "Unknown exchange"; *)
-(*       Writer.write_cstruct w order_update_cs; *)
-(*     end *)
-(*     else if m.S.tif = Some `Good_till_date_time then begin *)
-(*       Dtc_util.Trading.Order.Submit.reject order_update_cs m "BitMEX does not support TIF Good till datetime"; *)
-(*       Writer.write_cstruct w order_update_cs; *)
-(*     end *)
-(*     else if Option.is_some current_parent then begin *)
-(*       c.current_parent <- None; *)
-(*       Dtc_util.Trading.Order.Submit.reject order_update_cs Option.(value_exn current_parent) "Next received order was not an OCO"; *)
-(*       Writer.write_cstruct w order_update_cs; *)
-(*       Dtc_util.Trading.Order.Submit.reject order_update_cs m "Previous received order was also a parent and the current order is not an OCO"; *)
-(*       Writer.write_cstruct w order_update_cs; *)
-(*     end *)
-(*     else if m.S.parent then begin *)
-(*       set_parent_order c m; *)
-(*       Dtc_util.Trading.Order.Submit.update *)
-(*         ~status:`Pending_open ~reason:General_order_update *)
-(*         order_update_cs m "parent order %s stored" m.S.cli_ord_id; *)
-(*       Writer.write_cstruct w order_update_cs; *)
-(*       Log.debug log_dtc "Stored parent order %s" m.S.cli_ord_id *)
-(*     end *)
-(*     else *)
-(*       let on_exn _ = *)
-(*         Dtc_util.Trading.Order.Submit.update *)
-(*           ~status:`Rejected ~reason:New_order_rejected *)
-(*           order_update_cs m *)
-(*           "exception raised when trying to submit %s" m.S.cli_ord_id; *)
-(*         Writer.write_cstruct w order_update_cs; *)
-(*         Deferred.unit *)
-(*       in *)
-(*       don't_wait_for @@ eat_exn ~on_exn accept_exn *)
 
 (*   | Some SubmitNewOCOOrder -> *)
 (*     let module S = Trading.Order.SubmitOCO in *)
