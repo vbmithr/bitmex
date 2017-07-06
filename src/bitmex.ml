@@ -53,6 +53,20 @@ let write_message w (typ : DTC.dtcmessage_type) gen msg =
   Writer.write w header ;
   Writer.write w msg
 
+let seconds_of_ts_string ts =
+  Time_ns.(to_int_ns_since_epoch (of_string ts) / 1_000_000_000) |>
+  Int64.of_int
+
+let seconds_int32_of_ts ts =
+  Time_ns.(to_int_ns_since_epoch ts / 1_000_000_000) |>
+  Int32.of_int
+
+let float_of_ts ts =
+  Time_ns.to_int_ns_since_epoch ts // 1_000_000_000
+
+let float_of_ts_string ts =
+  Time_ns.(to_int_ns_since_epoch (of_string ts) // 1_000_000_000)
+
 module IS = struct
   module T = struct
     type t = Int.t * String.t [@@deriving sexp]
@@ -62,6 +76,15 @@ module IS = struct
   include T
   include Hashable.Make (T)
 end
+
+let use_testnet = ref false
+let base_uri = ref @@ Uri.of_string "https://www.bitmex.com"
+let my_exchange = ref "BMEX"
+let my_topic = "bitsouk"
+
+let log_bitmex = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
+let log_dtc = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
+let log_ws = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 
 module Connection = struct
   type t = {
@@ -106,16 +129,107 @@ module Connection = struct
     }
 
   let active : t String.Table.t = String.Table.create ()
+  let to_alist () = String.Table.to_alist active
 
   let find = String.Table.find active
   let find_exn = String.Table.find_exn active
   let set = String.Table.set active
   let remove = String.Table.remove active
 
+  let iter = String.Table.iter active
+
   let set_parent_order conn order =
     conn.current_parent <- Some order;
     Option.iter order.client_order_id
       ~f:(fun id -> String.Table.set conn.parents id id)
+end
+
+module Books = struct
+  type entry = {
+    price: float;
+    size: int;
+  }
+
+  let mapify_ob =
+    let fold_f ~key:_ ~data:{ price; size } map =
+      Float.Map.update map price ~f:begin function
+        | Some size' -> size + size'
+        | None -> size
+      end
+    in
+    Int.Table.fold ~init:Float.Map.empty ~f:fold_f
+
+  let bids : entry Int.Table.t String.Table.t = String.Table.create ()
+  let asks : entry Int.Table.t String.Table.t = String.Table.create ()
+  let initialized = Ivar.create ()
+
+  let get_bids symbol =
+    Option.value_map (String.Table.find bids symbol)
+      ~default:Float.Map.empty ~f:mapify_ob
+
+  let get_asks symbol =
+    Option.value_map (String.Table.find asks symbol)
+      ~default:Float.Map.empty ~f:mapify_ob
+
+  let update action { OrderBook.L2.symbol; id; side; size; price } =
+    (* find_exn cannot raise here *)
+    let bids = String.Table.find_or_add bids symbol ~default:Int.Table.create in
+    let asks = String.Table.find_or_add asks symbol ~default:Int.Table.create in
+    let table =
+      match side with
+      | `buy -> bids
+      | `sell -> asks
+      | `buy_sell_unset -> failwith "update_depth: empty side" in
+    let price =
+      match price with
+      | Some p -> Some p
+      | None -> begin match Int.Table.find table id with
+          | Some { price } -> Some price
+          | None -> None
+        end in
+    let size =
+      match size with
+      | Some s -> Some s
+      | None -> begin match Int.Table.find table id with
+          | Some { size } -> Some size
+          | None -> None
+        end in
+    match price, size with
+    | Some price, Some size ->
+      begin match action with
+        | Bmex_ws.Response.Update.Partial
+        | Insert
+        | Update -> Int.Table.set table id { size ; price }
+        | Delete -> Int.Table.remove table id
+      end;
+      let u = DTC.default_market_depth_update_level () in
+      let update_type =
+        match action with
+        | Partial
+        | Insert
+        | Update -> `market_depth_insert_update_level
+        | Delete -> `market_depth_delete_level in
+      let side =
+        match side with
+        | `buy -> Some `at_bid
+        | `sell -> Some `at_ask
+        | `buy_sell_unset -> None
+      in
+      u.side <- side ;
+      u.price <- Some price ;
+      u.quantity <- Some (Float.of_int size) ;
+      u.update_type <- Some update_type ;
+      let on_connection { Connection.addr; w; subs; subs_depth } =
+        let on_symbol_id symbol_id =
+          u.symbol_id <- Some symbol_id ;
+          (* Log.debug log_dtc "-> [%s] depth %s %s %s %f %d" addr_str (OB.sexp_of_action action |> Sexp.to_string) symbol side price size; *)
+          write_message w `market_depth_update_level DTC.gen_market_depth_update_level u
+        in
+        Option.iter String.Table.(find subs_depth symbol) ~f:on_symbol_id
+      in
+      Connection.iter ~f:on_connection
+    | _ ->
+      Log.info log_bitmex "update_depth: received update before snapshot, ignoring"
 end
 
 module Instrument = struct
@@ -169,51 +283,131 @@ module Instrument = struct
   }
 
   let active : t String.Table.t = String.Table.create ()
+  let initialized = Ivar.create ()
 
   let mem = String.Table.mem active
   let find = String.Table.find active
   let find_exn = String.Table.find_exn active
   let set = String.Table.set active
   let remove = String.Table.remove active
-end
 
-let use_testnet = ref false
-let base_uri = ref @@ Uri.of_string "https://www.bitmex.com"
-let my_exchange = ref "BMEX"
-let my_topic = "bitsouk"
+  let iter = String.Table.iter active
 
-let log_bitmex = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
-let log_dtc = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
-let log_ws = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
+  let delete instrObj =
+    let instrObj = RespObj.of_json instrObj in
+    let symbol = RespObj.(string_exn instrObj "symbol") in
+    remove symbol ;
+    Log.info log_bitmex "deleted instrument %s" symbol
 
-module Book = struct
-  type entry = {
-    price: float;
-    size: int;
-  }
-
-  let mapify_ob =
-    let fold_f ~key:_ ~data:{ price; size } map =
-      Float.Map.update map price ~f:(function
-          | Some size' -> size + size'
-          | None -> size
-        )
+  let insert instrObj =
+    let instrObj = RespObj.of_json instrObj in
+    let symbol = RespObj.string_exn instrObj "symbol" in
+    let secdef = to_secdef ~testnet:!use_testnet instrObj in
+    let instr = create ~instrObj ~secdef () in
+    set symbol instr;
+    Log.info log_bitmex "inserted instrument %s" symbol;
+    (* Send secdef response to connections. *)
+    let on_connection { Connection.addr; w } =
+      secdef.is_final_message <- Some true ;
+      write_message w `security_definition_response
+        DTC.gen_security_definition_response secdef
     in
-    Int.Table.fold ~init:Float.Map.empty ~f:fold_f
+    Connection.iter ~f:on_connection
 
-  let bids : entry Int.Table.t String.Table.t = String.Table.create ()
-  let asks : entry Int.Table.t String.Table.t = String.Table.create ()
+  let send_instr_update_msgs w instr symbol_id =
+    let open RespObj in
+    Option.iter (int64 instr "volume") ~f:begin fun volume ->
+      let msg = DTC.default_market_data_update_session_volume () in
+      msg.symbol_id <- Some symbol_id ;
+      msg.volume <- Some Int64.(to_float volume) ;
+      write_message w `market_data_update_session_volume
+        DTC.gen_market_data_update_session_volume msg
+    end ;
+    Option.iter (float instr "lowPrice") ~f:begin fun low ->
+      let msg = DTC.default_market_data_update_session_low () in
+      msg.symbol_id <- Some symbol_id ;
+      msg.price <- Some low ;
+      write_message w `market_data_update_session_low
+        DTC.gen_market_data_update_session_low msg
+    end ;
+    Option.iter (float instr "highPrice") ~f:begin fun high ->
+      let msg = DTC.default_market_data_update_session_high () in
+      msg.symbol_id <- Some symbol_id ;
+      msg.price <- Some high ;
+      write_message w `market_data_update_session_high
+        DTC.gen_market_data_update_session_high msg
+    end ;
+    Option.iter (int64 instr "openInterest") ~f:begin fun open_interest ->
+      let msg = DTC.default_market_data_update_open_interest () in
+      msg.symbol_id <- Some symbol_id ;
+      msg.open_interest <- Some (Int64.to_int32_exn open_interest) ;
+      write_message w `market_data_update_open_interest
+        DTC.gen_market_data_update_open_interest msg
+    end ;
+    Option.iter (float instr "prevClosePrice")~f:begin fun prev_close ->
+      let msg = DTC.default_market_data_update_session_open () in
+      msg.symbol_id <- Some symbol_id ;
+      msg.price <- Some prev_close ;
+      write_message w `market_data_update_session_open
+        DTC.gen_market_data_update_session_open msg
+    end
 
-  let get_bids symbol =
-    Option.value_map (String.Table.find bids symbol)
-      ~default:Float.Map.empty ~f:mapify_ob
-
-  let get_asks symbol =
-    Option.value_map (String.Table.find asks symbol)
-      ~default:Float.Map.empty ~f:mapify_ob
+  let update instrObj =
+    let instrObj = RespObj.of_json instrObj in
+    let symbol = RespObj.string_exn instrObj "symbol" in
+    match find symbol with
+    | None ->
+      Log.error log_bitmex "update_instr: unable to find %s" symbol;
+    | Some instr ->
+      instr.instrObj <- RespObj.merge instr.instrObj instrObj;
+      Log.debug log_bitmex "updated instrument %s" symbol;
+      (* Send messages to subscribed clients according to the type of update. *)
+      let on_connection { Connection.addr; w; subs } =
+        let on_symbol_id symbol_id =
+          send_instr_update_msgs w instrObj symbol_id;
+          Log.debug log_dtc "-> [%s] instrument %s" addr symbol
+        in
+        Option.iter String.Table.(find subs symbol) ~f:on_symbol_id
+      in
+      Connection.iter ~f:on_connection
 end
 
-let quotes : Quote.t String.Table.t = String.Table.create ()
+module Quotes = struct
+  let quotes : Quote.t String.Table.t = String.Table.create ()
+  let initialized = Ivar.create ()
+
+  let find = String.Table.find quotes
+  let find_exn = String.Table.find_exn quotes
+
+  let update ({ Quote.timestamp; symbol; bidPrice; bidSize; askPrice; askSize } as q) =
+    let old_q = String.Table.find_or_add quotes symbol ~default:(fun () -> q) in
+    let merged_q = Quote.merge old_q q in
+    let bidPrice = Option.value ~default:Float.max_finite_value merged_q.bidPrice in
+    let bidSize = Option.value ~default:0 merged_q.bidSize in
+    let askPrice = Option.value ~default:Float.max_finite_value merged_q.askPrice in
+    let askSize = Option.value ~default:0 merged_q.askSize in
+    String.Table.set quotes ~key:q.symbol ~data:merged_q;
+    Log.debug log_bitmex "set quote %s" q.symbol;
+    let u = DTC.default_market_data_update_bid_ask () in
+    u.bid_price <- Some bidPrice ;
+    u.bid_quantity <- Some (Float.of_int bidSize) ;
+    u.ask_price <- Some askPrice ;
+    u.ask_quantity <- Some (Float.of_int askSize) ;
+    u.date_time <- seconds_int32_of_ts merged_q.timestamp ;
+    let on_connection { Connection.addr; w; subs; subs_depth } =
+      let on_symbol_id symbol_id =
+        u.symbol_id <- Some symbol_id ;
+        Log.debug log_dtc "-> [%s] bidask %s %f %d %f %d"
+          addr q.symbol bidPrice bidSize askPrice askSize ;
+        write_message w `market_data_update_bid_ask
+          DTC.gen_market_data_update_bid_ask u
+      in
+      match String.Table.(find subs q.symbol, find subs_depth q.symbol) with
+      | Some id, None -> on_symbol_id id
+      | _ -> ()
+    in
+    Connection.iter ~f:on_connection
+end
 
 let send_heartbeat { Connection.addr; w; dropped } ival =
   let ival = Option.value_map ival ~default:10 ~f:Int32.to_int_exn in
@@ -229,15 +423,6 @@ let send_heartbeat { Connection.addr; w; dropped } ival =
   | Error _ -> Log.error log_dtc "-/-> %s HB" addr
   | Ok _ -> ()
 
-let seconds_of_ts_string ts =
-  Time_ns.(to_int_ns_since_epoch (of_string ts) / 1_000_000_000) |>
-  Int64.of_int
-
-let float_of_ts ts =
-  Time_ns.to_int_ns_since_epoch ts // 1_000_000_000
-
-let float_of_ts_string ts =
-  Time_ns.(to_int_ns_since_epoch (of_string ts) // 1_000_000_000)
 
 let write_order_update ~nb_msgs ~msg_number w e =
   let invalid_arg' execType ordStatus =
@@ -292,10 +477,7 @@ let write_order_update ~nb_msgs ~msg_number w e =
     let u = DTC.default_order_update () in
     let price = RespObj.(float_or_null_exn ~default:Float.max_finite_value e "price") in
     let stopPx = RespObj.(float_or_null_exn ~default:Float.max_finite_value e "stopPx") in
-    let side = match (RespObj.string_exn e "side" |> Side.of_string) with
-      | None -> `buy_sell_unset
-      | Some `Buy -> `buy
-      | Some `Sell -> `sell in
+    let side = RespObj.string_exn e "side" |> Side.of_string in
     let ordType =
       (OrderType.of_string RespObj.(string_exn e "ordType")) in
     let timeInForce =
@@ -511,8 +693,8 @@ let accept_logon_request addr w req client stop_exec_inst trading =
   r.market_depth_updates_best_bid_and_ask <- Some true ;
   r.trading_is_supported <- Some trading_supported ;
   r.order_cancel_replace_supported <- Some true ;
-  r.ocoorders_supported <- Some true ;
-  r.bracket_orders_supported <- Some true ;
+  r.ocoorders_supported <- Some false ;
+  r.bracket_orders_supported <- Some false ;
 
   don't_wait_for @@
   send_heartbeat client req.DTC.Logon_request.heartbeat_interval_in_seconds;
@@ -620,7 +802,7 @@ let write_market_data_snapshot ?id addr w symbol
     write_message w `market_data_snapshot DTC.gen_market_data_snapshot snap
   end
   else begin
-    let { Quote.bidPrice; bidSize; askPrice; askSize } = String.Table.find_exn quotes symbol in
+    let { Quote.bidPrice; bidSize; askPrice; askSize } = Quotes.find_exn symbol in
     let open Option in
     let open RespObj in
     let snap = DTC.default_market_data_snapshot () in
@@ -700,8 +882,8 @@ let reject_market_depth_request ?id addr w k =
   end k
 
 let write_market_depth_snapshot ?id addr w ~symbol ~exchange ~num_levels =
-  let bids = Book.get_bids symbol in
-  let asks = Book.get_asks symbol in
+  let bids = Books.get_bids symbol in
+  let asks = Books.get_asks symbol in
   let snap = DTC.default_market_depth_snapshot_level () in
   snap.symbol_id <- id ;
   snap.side <- Some `at_bid ;
@@ -832,10 +1014,7 @@ let send_historical_order_fills_response ?request_id addr w = function
     resp.request_id <- request_id ;
     List.iteri orders ~f:begin fun i o ->
       let o = RespObj.of_json o in
-      let side = match (RespObj.string_exn o "side" |> Side.of_string) with
-        | None -> `buy_sell_unset
-        | Some `Buy -> `buy
-        | Some `Sell -> `sell in
+      let side = RespObj.string_exn o "side" |> Side.of_string in
       resp.message_number <- Some Int32.(succ @@ of_int_exn i) ;
       resp.symbol <- Some RespObj.(string_exn o "symbol") ;
       resp.exchange <- Some !my_exchange ;
@@ -1384,48 +1563,6 @@ let cancel_order addr w msg =
 (*     Cstruct.hexdump_to_buffer buf msg_cs; *)
 (*     Log.error log_dtc "%s" @@ Buffer.contents buf *)
 
-(* let dtcserver ~server ~port = *)
-(*   let server_fun addr r w = *)
-(*     (\* So that process does not allocate all the time. *\) *)
-(*     let scratchbuf = Bigstring.create 1024 in *)
-(*     let rec handle_chunk w consumed buf ~pos ~len = *)
-(*       if len < 2 then return @@ `Consumed (consumed, `Need_unknown) *)
-(*       else *)
-(*         let msglen = Bigstring.unsafe_get_int16_le buf ~pos in *)
-(*         if len < msglen then return @@ `Consumed (consumed, `Need msglen) *)
-(*         else begin *)
-(*           let msg_cs = Cstruct.of_bigarray buf ~off:pos ~len:msglen in *)
-(*           process addr w msg_cs scratchbuf; *)
-(*           handle_chunk w (consumed + msglen) buf (pos + msglen) (len - msglen) *)
-(*         end *)
-(*     in *)
-(*     let on_client_io_error exn = *)
-(*       Log.error log_dtc "on_client_io_error (%s): %s" *)
-(*         Socket.Address.(to_string addr) Exn.(to_string exn) *)
-(*     in *)
-(*     let cleanup r w = *)
-(*       Log.info log_dtc "client %s disconnected" Socket.Address.(to_string addr); *)
-(*       let { ws_uuid } = InetAddr.Table.find_exn clients addr in *)
-(*       let addr_str = InetAddr.sexp_of_t addr |> Sexp.to_string in *)
-(*       InetAddr.Table.remove clients addr; *)
-(*       Deferred.all_unit [Pipe.write client_ws_w @@ Unsubscribe (ws_uuid, addr_str); Writer.close w; Reader.close r] *)
-(*     in *)
-(*     Deferred.ignore @@ Monitor.protect *)
-(*       ~name:"server_fun" *)
-(*       ~finally:(fun () -> cleanup r w) *)
-(*       (fun () -> *)
-(*          Monitor.detach_and_iter_errors Writer.(monitor w) ~f:on_client_io_error; *)
-(*          Reader.(read_one_chunk_at_a_time r ~handle_chunk:(handle_chunk w 0)) *)
-(*       ) *)
-(*   in *)
-(*   let on_handler_error_f addr exn = *)
-(*     Log.error log_dtc "on_handler_error (%s): %s" *)
-(*       Socket.Address.(to_string addr) Exn.(to_string exn) *)
-(*   in *)
-(*   Conduit_async.serve *)
-(*     ~on_handler_error:(`Call on_handler_error_f) *)
-(*     server (Tcp.on_port port) server_fun *)
-
 let dtcserver ~server ~port =
   let server_fun addr r w =
     let addr = Socket.Address.Inet.to_string addr in
@@ -1489,342 +1626,172 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.on_port port) server_fun
 
-let send_instr_update_msgs w buf_cs instr symbol_id =
-  let open RespObj in
-  Option.iter (int64 instr "volume")
-    ~f:(fun v ->
-        let open MarketData.UpdateSession in
-        let buf_cs = Cstruct.of_bigarray buf_cs ~len:sizeof_cs in
-        write ~kind:`Volume ~symbol_id ~data:Int64.(to_float v) buf_cs;
-        Writer.write_cstruct w buf_cs
-      );
-  Option.iter (float instr "lowPrice")
-    ~f:(fun p ->
-        let open MarketData.UpdateSession in
-        let buf_cs = Cstruct.of_bigarray buf_cs ~len:sizeof_cs in
-        write ~kind:`Low ~symbol_id ~data:p buf_cs;
-        Writer.write_cstruct w buf_cs
-      );
-  Option.iter (float instr "highPrice")
-    ~f:(fun p ->
-        let open MarketData.UpdateSession in
-        let buf_cs = Cstruct.of_bigarray buf_cs ~len:sizeof_cs in
-        write ~kind:`High ~symbol_id ~data:p buf_cs;
-        Writer.write_cstruct w buf_cs
-      );
-  Option.iter (int64 instr "openInterest")
-    ~f:(fun p ->
-        let open MarketData.UpdateOpenInterest in
-        let buf_cs = Cstruct.of_bigarray buf_cs ~len:sizeof_cs in
-        write ~symbol_id ~open_interest:Int64.(to_int32_exn p) buf_cs;
-        Writer.write_cstruct w buf_cs
-      );
-  Option.iter (float instr "prevClosePrice")
-    ~f:(fun p ->
-        let open MarketData.UpdateSession in
-        let buf_cs = Cstruct.of_bigarray buf_cs ~len:sizeof_cs in
-        write ~kind:`Open ~symbol_id ~data:p buf_cs;
-        Writer.write_cstruct w buf_cs
-      )
-
-let delete_instr instrObj =
-  let instrObj = RespObj.of_json instrObj in
-  Log.info log_bitmex "deleted instrument %s" RespObj.(string_exn instrObj "symbol")
-
-let insert_instr buf_cs instrObj =
-  let buf_cs = Cstruct.of_bigarray buf_cs ~len:SecurityDefinition.Response.sizeof_cs in
-  let instrObj = RespObj.of_json instrObj in
-  let key = RespObj.string_exn instrObj "symbol" in
-  let secdef = Instrument.to_secdef ~testnet:!use_testnet instrObj in
-  let instr = create_instr ~instrObj ~secdef () in
-  let books = Int.Table.{ bids = create () ; asks = create () } in
-  String.Table.set instruments key instr;
-  String.Table.set orderbooks ~key ~data:books;
-  Log.info log_bitmex "inserted instrument %s" key;
-  (* Send secdef response to clients. *)
-  let on_client { addr; addr_str; w; subs; _ } =
-    SecurityDefinition.Response.to_cstruct buf_cs { secdef with final = true };
-    Writer.write_cstruct w buf_cs;
-  in
-  InetAddr.Table.iter clients ~f:on_client
-
-let update_instr buf_cs instrObj =
-  let instrObj = RespObj.of_json instrObj in
-  let symbol = RespObj.string_exn instrObj "symbol" in
-  match String.Table.find instruments symbol with
-  | None ->
-    Log.error log_bitmex "update_instr: unable to find %s" symbol;
-  | Some instr ->
-    instr.instrObj <- RespObj.merge instr.instrObj instrObj;
-    Log.debug log_bitmex "updated instrument %s" symbol;
-    (* Send messages to subscribed clients according to the type of update. *)
-    let on_client { addr; addr_str; w; subs; _ } =
-      let on_symbol_id symbol_id =
-        send_instr_update_msgs w buf_cs instrObj symbol_id;
-        Log.debug log_dtc "-> [%s] instrument %s" addr_str symbol
-      in
-      Option.iter String.Table.(find subs symbol) ~f:on_symbol_id
-    in
-    InetAddr.Table.iter clients ~f:on_client
-
-let update_depths update_cs action { OrderBook.L2.symbol; id; side; size; price } =
-  (* find_exn cannot raise here *)
-  let { bids; asks } =  String.Table.find_exn orderbooks symbol in
-  let side = side_of_bmex side in
-  let table = match side with
-  | Some `Buy -> bids
-  | Some `Sell -> asks
-  | None -> failwith "update_depth: empty side" in
-  let price = match price with
-    | Some p -> Some p
-    | None -> begin match Int.Table.find table id with
-        | Some { price } -> Some price
-        | None -> None
-      end
-  in
-  let size = match size with
-    | Some s -> Some s
-    | None -> begin match Int.Table.find table id with
-        | Some { size } -> Some size
-        | None -> None
-      end
-  in
-  match price, size with
-  | Some price, Some size ->
-    begin match action with
-      | OB.Partial | Insert | Update -> Int.Table.set table id { size ; price }
-      | Delete -> Int.Table.remove table id
-    end;
-    let on_client { addr; addr_str; w; subs; subs_depth; _} =
-      let on_symbol_id symbol_id =
-        (* Log.debug log_dtc "-> [%s] depth %s %s %s %f %d" addr_str (OB.sexp_of_action action |> Sexp.to_string) symbol side price size; *)
-        MarketDepth.Update.write
-          ~op:(match action with Partial | Insert | Update -> `Insert_update | Delete -> `Delete)
-          ~p:price
-          ~v:(Float.of_int size)
-          ~symbol_id
-          ?side
-          update_cs;
-        Writer.write_cstruct w update_cs
-      in
-      Option.iter String.Table.(find subs_depth symbol) ~f:on_symbol_id
-    in
-    InetAddr.Table.iter clients ~f:on_client
-  | _ ->
-    Log.info log_bitmex "update_depth: received update before snapshot, ignoring"
-
-let update_quote update_cs q =
-  let old_q = String.Table.find_or_add quotes q.Quote.symbol ~default:(fun () -> q) in
-  let merged_q = Quote.merge old_q q in
-  let bidPrice = Option.value ~default:Float.max_finite_value merged_q.bidPrice in
-  let bidSize = Option.value ~default:0 merged_q.bidSize in
-  let askPrice = Option.value ~default:Float.max_finite_value merged_q.askPrice in
-  let askSize = Option.value ~default:0 merged_q.askSize in
-  String.Table.set quotes ~key:q.symbol ~data:merged_q;
-  Log.debug log_bitmex "set quote %s" q.symbol;
-  let on_client { addr; addr_str; w; subs; subs_depth; _} =
-    let on_symbol_id symbol_id =
-      Log.debug log_dtc "-> [%s] bidask %s %f %d %f %d"
-        addr_str q.symbol bidPrice bidSize askPrice askSize;
-      MarketData.UpdateBidAsk.write
-        ~symbol_id
-        ~bid:bidPrice
-        ~bid_qty:Float.(of_int bidSize)
-        ~ask:askPrice
-        ~ask_qty:Float.(of_int askSize)
-        ~ts:(Time_ns.(of_string merged_q.timestamp))
-        update_cs;
-      Writer.write_cstruct w update_cs
-    in
-    match String.Table.(find subs q.symbol, find subs_depth q.symbol) with
-    | Some id, None -> on_symbol_id id
-    | _ -> ()
-  in
-  InetAddr.Table.iter clients ~f:on_client
-
-let update_trade cs { Trade.symbol; timestamp; price; size; side; tickDirection; trdMatchID;
-                      grossValue; homeNotional; foreignNotional; id } =
-  let open Trade in
-  Log.debug log_bitmex "trade %s %s %f %d" symbol side price size;
-  match side_of_bmex side, String.Table.find instruments symbol with
-  | None, _ -> ()
+let update_trade { Trade.symbol; timestamp; price; size; side } =
+  Log.debug log_bitmex "trade %s %s %f %d" symbol (Side.show side) price size;
+  match side, Instrument.find symbol with
+  | `buy_sell_unset, _ -> ()
   | _, None ->
     Log.error log_bitmex "update_trade: found no instrument for %s" symbol
-  | Some s, Some instr ->
+  | _, Some instr ->
     instr.last_trade_price <- price;
     instr.last_trade_size <- size;
-    instr.last_trade_ts <- Time_ns.of_string timestamp;
+    instr.last_trade_ts <- timestamp;
     (* Send trade updates to subscribers. *)
-    let on_client { addr; addr_str; w; subs; _} =
+    let at_bid_or_ask =
+      match side with
+      | `buy -> `at_bid
+      | `sell -> `at_ask
+      | `buy_sell_unset -> `bid_ask_unset in
+    let u = DTC.default_market_data_update_trade () in
+    u.at_bid_or_ask <- Some at_bid_or_ask ;
+    u.price <- Some price ;
+    u.volume <- Some (Int.to_float size) ;
+    u.date_time <- Some (float_of_ts timestamp) ;
+    let on_connection { Connection.addr; w; subs } =
       let on_symbol_id symbol_id =
-        MarketData.UpdateTrade.write
-          ~symbol_id
-          ~side:s
-          ~p:price
-          ~v:(Int.to_float size)
-          ~ts:(Time_ns.of_string timestamp)
-          cs;
-        Writer.write_cstruct w cs;
-        Log.debug log_dtc "-> [%s] trade %s %s %f %d" addr_str symbol side price size
+        u.symbol_id <- Some symbol_id ;
+        write_message w `market_data_update_trade
+          DTC.gen_market_data_update_trade u ;
+        Log.debug log_dtc "-> [%s] trade %s %s %f %d"
+          addr symbol (Side.show side) price size
       in
       Option.iter String.Table.(find subs symbol) ~f:on_symbol_id
     in
-    InetAddr.Table.iter clients ~f:on_client
+    Connection.iter ~f:on_connection
 
-let bitmex_ws ~instrs_initialized ~orderbook_initialized ~quotes_initialized =
-  let open Ws in
-  let buf_cs = Bigstring.create 4096 in
-  let trade_update_cs = Cstruct.of_bigarray ~len:MarketData.UpdateTrade.sizeof_cs buf_cs in
-  let depth_update_cs = Cstruct.of_bigarray ~len:MarketDepth.Update.sizeof_cs buf_cs in
-  let bidask_update_cs = Cstruct.of_bigarray ~len:MarketData.UpdateBidAsk.sizeof_cs buf_cs in
-  let on_update update =
-    let action = update_action_of_string update.action in
-    match action, update.table, update.data with
-    | Update, "instrument", instrs ->
-      if Ivar.is_full instrs_initialized then List.iter instrs ~f:(update_instr buf_cs)
-    | Delete, "instrument", instrs ->
-      if Ivar.is_full instrs_initialized then List.iter instrs ~f:delete_instr
-    | _, "instrument", instrs ->
-      List.iter instrs ~f:(insert_instr buf_cs);
-      Ivar.fill_if_empty instrs_initialized ()
-    | _, "orderBookL2", depths ->
-      let filter_f json = match OrderBook.L2.of_yojson json with
-        | Ok u -> Some u
-        | Error reason ->
-          Log.error log_bitmex "%s: %s (%s)"
-            reason Yojson.Safe.(to_string json) update.action;
-          None
-      in
-      let depths = List.filter_map depths ~f:filter_f in
-      let depths = List.group depths
-          ~break:(fun { symbol } { symbol=symbol' } -> symbol <> symbol')
-     in
-      don't_wait_for begin
-        Ivar.read instrs_initialized >>| fun () ->
-        List.iter depths ~f:begin function
-          | [] -> ()
-          | h::t as ds ->
-            Log.debug log_bitmex "depth update %s" h.symbol;
-            List.iter ds ~f:(update_depths depth_update_cs action)
-        end;
-        Ivar.fill_if_empty orderbook_initialized ()
-      end
-    | _, "trade", trades ->
-      let open Trade in
-      let iter_f t = match Trade.of_yojson t with
-        | Error msg ->
-          Log.error log_bitmex "%s" msg
-        | Ok t -> update_trade trade_update_cs t
-      in
-      don't_wait_for begin
-        Ivar.read instrs_initialized >>| fun () ->
-        List.iter trades ~f:iter_f
-      end
-    | _, "quote", quotes ->
-      let filter_f json =
-        match Quote.of_yojson json with
-        | Ok q -> Some q
-        | Error reason ->
-          Log.error log_bitmex "%s: %s (%s)"
-            reason Yojson.Safe.(to_string json) update.action;
-          None
-      in
-      let quotes = List.filter_map quotes ~f:filter_f in
-      List.iter quotes ~f:(update_quote bidask_update_cs);
-      Ivar.fill_if_empty quotes_initialized ()
-    | _, table, json ->
-      Log.error log_bitmex "Unknown/ignored BitMEX DB table %s or wrong json %s"
-        table Yojson.Safe.(to_string @@ `List json)
-  in
-  let to_ws, to_ws_w = Pipe.create () in
-  let bitmex_topics = ["instrument"; "quote"; "orderBookL2"; "trade"] in
-  let clients_topics = ["order"; "execution"; "position"; "margin"] in
-  let subscribe_topics ~id ~topic ~topics =
-    let payload =
-      create_request
-        ~op:"subscribe"
-        ~args:(`List (List.map topics ~f:(fun t -> `String t)))
-        ()
+let on_update { Bmex_ws.Response.Update.table ; action ; data } =
+  match action, table, data with
+  | Update, "instrument", instrs ->
+    if Ivar.is_full Instrument.initialized then
+      List.iter instrs ~f:Instrument.update
+  | Delete, "instrument", instrs ->
+    if Ivar.is_full Instrument.initialized then
+      List.iter instrs ~f:Instrument.delete
+  | _, "instrument", instrs ->
+    List.iter instrs ~f:Instrument.insert ;
+    Ivar.fill_if_empty Instrument.initialized ()
+  | _, "orderBookL2", depths ->
+    let depths = List.map depths ~f:OrderBook.L2.of_yojson in
+    let depths = List.group depths
+        ~break:(fun { symbol } { symbol=symbol' } -> symbol <> symbol')
     in
-    MD.message id topic (request_to_yojson payload)
-  in
-  let subscribe_client ({ addr; key; secret } as c) =
+    don't_wait_for begin
+      Ivar.read Instrument.initialized >>| fun () ->
+      List.iter depths ~f:begin function
+        | [] -> ()
+        | h::t as ds ->
+          Log.debug log_bitmex "depth update %s" h.symbol;
+          List.iter ds ~f:(Books.update action)
+      end;
+      Ivar.fill_if_empty Books.initialized ()
+    end
+  | _, "trade", trades ->
+    let open Trade in
+    don't_wait_for begin
+      Ivar.read Instrument.initialized >>| fun () ->
+      List.iter trades ~f:(Fn.compose update_trade Trade.of_yojson)
+    end
+  | _, "quote", quotes ->
+    List.iter quotes ~f:(Fn.compose Quotes.update Quote.of_yojson) ;
+    Ivar.fill_if_empty Quotes.initialized ()
+  | _, table, json ->
+    Log.error log_bitmex "Unknown/ignored BitMEX DB table %s or wrong json %s"
+      table Yojson.Safe.(to_string @@ `List json)
+
+let subscribe_topics ~id ~topic ~topics =
+  let open Bmex_ws in
+  let payload =
+    Request.(subscribe (List.map topics ~f:Sub.create) |> to_yojson) in
+  Bmex_ws.MD.message id topic payload
+
+let on_ws_msg to_ws_w my_uuid msg =
+  let open Bmex_ws in
+  let bitmex_topics = Topic.[Instrument; Quote; OrderBookL2; Trade] in
+  let clients_topics = Topic.[Order; Execution; Position; Margin] in
+  match MD.of_yojson msg with
+  | Unsubscribe _ -> ()
+  | Subscribe _ -> ()
+  | Message { stream = { id ; topic } ; payload } ->
+    match Response.of_yojson payload, topic = my_topic with
+
+    (* Server *)
+    | Response.Welcome _, true ->
+      Pipe.write_without_pushback to_ws_w @@
+      MD.to_yojson @@ subscribe_topics my_uuid my_topic bitmex_topics
+    | Error err, true ->
+      Log.error log_bitmex "BitMEX: error %s" err
+    | Response { subscribe = Some { topic; symbol = Some sym }}, true ->
+        Log.info log_bitmex "BitMEX: subscribed to %s:%s" (Topic.show topic) sym
+    | Response { subscribe = Some { topic; symbol = None }}, true ->
+        Log.info log_bitmex "BitMEX: subscribed to %s" (Topic.show topic)
+    | Update update, true -> on_update update
+
+    (* Clients *)
+    | Welcome _, false ->
+      Option.iter (Connection.find topic) ~f:begin fun { key; secret } ->
+        Pipe.write_without_pushback to_ws_w @@
+        MD.to_yojson @@ MD.auth ~id ~topic ~key ~secret
+      end
+    | Error err, false ->
+      Log.error log_bitmex "%s: error %s" topic err
+    | Response { request = AuthKey _ }, false ->
+      Pipe.write_without_pushback to_ws_w @@
+      MD.to_yojson @@ subscribe_topics ~id ~topic ~topics:clients_topics
+    | Response { subscribe = Some { topic = subscription } }, false ->
+      Log.info log_bitmex "%s: subscribed to %s" topic (Topic.show subscription)
+    | Response _, false ->
+      Log.error log_bitmex "%s: unexpected response %s" topic (Yojson.Safe.to_string payload)
+    | Update update, false -> begin
+      match Connection.find topic with
+      | None ->
+        Pipe.write_without_pushback client_ws_w (Unsubscribe (Uuid.of_string id, topic))
+      | Some { ws_w } -> Pipe.write_without_pushback ws_w update
+    end
+    | _ -> ()
+
+let bitmex_ws () =
+  let open Bmex_ws in
+  let to_ws, to_ws_w = Pipe.create () in
+  let subscribe_client ({ Connection.addr; key; secret } as c) =
     let id = Uuid.create () in
     let id_str = Uuid.to_string id in
-    let topic = InetAddr.sexp_of_t addr |> Sexp.to_string_mach in
     c.ws_uuid <- id;
-    Pipe.write to_ws_w @@ MD.to_yojson @@ MD.subscribe ~id:id_str ~topic
+    Pipe.write to_ws_w MD.(to_yojson (subscribe ~id:id_str ~topic:addr))
   in
-  let my_uuid = Uuid.create () in
-  let my_uuid_str = Uuid.to_string my_uuid in
-  let connected = Mvar.create () in
+  let my_uuid = Uuid.(create () |> to_string) in
+  let connected = Condition.create () in
   let rec resubscribe () =
-    Mvar.take (Mvar.read_only connected) >>= fun () ->
-    Pipe.write to_ws_w @@ MD.to_yojson @@ MD.subscribe ~id:my_uuid_str ~topic:my_topic >>= fun () ->
-    Deferred.List.iter (InetAddr.Table.to_alist clients) ~how:`Sequential ~f:(fun (_addr, c) -> subscribe_client c) >>=
+    Condition.wait connected >>= fun () ->
+    Pipe.write to_ws_w @@ MD.to_yojson @@
+    MD.subscribe ~id:my_uuid ~topic:my_topic >>= fun () ->
+    Deferred.List.iter (Connection.to_alist ())
+      ~how:`Sequential ~f:(fun (_addr, c) -> subscribe_client c) >>=
     resubscribe
   in
   don't_wait_for @@ resubscribe ();
-  let ws = open_connection ~connected ~to_ws ~log:log_ws ~testnet:!use_testnet ~md:true ~topics:[] () in
+  let ws = open_connection ~connected ~to_ws ~log:log_ws
+      ~testnet:!use_testnet ~md:true ~topics:[] () in
   don't_wait_for begin
     Pipe.iter client_ws_r ~f:begin function
       | Subscribe c -> subscribe_client c
-      | Unsubscribe (id, topic) -> Pipe.write to_ws_w @@ MD.to_yojson @@ MD.unsubscribe ~id:(Uuid.to_string id) ~topic
+      | Unsubscribe (id, topic) ->
+        Pipe.write to_ws_w @@ MD.to_yojson @@
+        MD.unsubscribe ~id:(Uuid.to_string id) ~topic
     end
   end;
-  let on_ws_msg msg = match MD.of_yojson msg with
-    | Error msg -> Log.error log_bitmex "%s" msg
-    | Ok { MD.typ; id; topic; payload = Some payload } -> begin
-        match Ws.msg_of_yojson payload, topic = my_topic with
-
-        (* Server *)
-        | Welcome, true ->
-          Pipe.write_without_pushback to_ws_w @@ MD.to_yojson @@ subscribe_topics my_uuid_str my_topic bitmex_topics
-        | Error err, true ->
-          Log.error log_bitmex "BitMEX: error %s" @@ show_error err
-        | Ok { request = { op = "subscribe" }; subscribe; success }, true ->
-          Log.info log_bitmex "BitMEX: subscribed to %s: %b" subscribe success
-        | Ok { success }, true ->
-          Log.error log_bitmex "BitMEX: unexpected response %s" (Yojson.Safe.to_string payload)
-        | Update update, true -> on_update update
-
-        (* Clients *)
-        | Welcome, false ->
-          let addr = Fn.compose InetAddr.Blocking_sexp.t_of_sexp Sexp.of_string topic in
-          Option.iter (InetAddr.Table.find clients addr) ~f:begin fun { key; secret } ->
-            Pipe.write_without_pushback to_ws_w @@ MD.to_yojson @@ MD.auth ~id ~topic ~key ~secret
-          end
-        | Error err, false ->
-          Log.error log_bitmex "%s: error %s" topic @@ show_error err
-        | Ok { request = { op = "authKey"}; success}, false ->
-          Pipe.write_without_pushback to_ws_w @@ MD.to_yojson @@ subscribe_topics ~id ~topic ~topics:clients_topics
-        | Ok { request = { op = "subscribe"}; subscribe; success}, false ->
-          Log.info log_bitmex "%s: subscribed to %s: %b" topic subscribe success
-        | Ok { success }, false ->
-          Log.error log_bitmex "%s: unexpected response %s" topic (Yojson.Safe.to_string payload)
-        | Update update, false ->
-          let addr = Sexp.of_string topic |> InetAddr.Blocking_sexp.t_of_sexp in
-          match InetAddr.Table.find clients addr with
-          | None -> if typ <> Unsubscribe then Pipe.write_without_pushback client_ws_w (Unsubscribe (Uuid.of_string id, topic))
-          | Some { ws_w } -> Pipe.write_without_pushback ws_w update
-      end
-    | _ -> ()
-  in
   Monitor.handle_errors
-    (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
+    (fun () -> Pipe.iter_without_pushback
+        ~continue_on_error:true ws ~f:(on_ws_msg to_ws_w my_uuid))
     (fun exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn)
 
 let main tls testnet port daemon pidfile logfile loglevel ll_ws ll_dtc ll_bitmex crt_path key_path =
   let pidfile = if testnet then add_suffix pidfile "_testnet" else pidfile in
   let logfile = if testnet then add_suffix logfile "_testnet" else logfile in
   let run server =
-    let instrs_initialized = Ivar.create () in
-    let orderbook_initialized = Ivar.create () in
-    let quotes_initialized = Ivar.create () in
     Log.info log_bitmex "WS feed starting";
-    let bitmex_th = bitmex_ws ~instrs_initialized ~orderbook_initialized ~quotes_initialized in
+    let bitmex_th = bitmex_ws () in
     Deferred.List.iter ~how:`Parallel ~f:Ivar.read
-      [instrs_initialized; orderbook_initialized; quotes_initialized] >>= fun () ->
+      [Instrument.initialized; Books.initialized; Quotes.initialized] >>= fun () ->
     dtcserver ~server ~port >>= fun dtc_server ->
     Log.info log_dtc "DTC server started";
     Deferred.all_unit [Tcp.Server.close_finished dtc_server; bitmex_th]
