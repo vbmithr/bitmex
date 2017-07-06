@@ -1000,16 +1000,14 @@ let submit_order w ~key ~secret (req : DTC.Submit_new_single_order.t) stop_exec_
       ?text:req.free_form_text
       ~symbol ~qty ~ordType ~timeInForce ()
   in
-  don't_wait_for begin
-    REST.Order.submit_bulk
-      ~log:log_bitmex
-      ~testnet:!use_testnet ~key ~secret [order] >>| function
-    | Ok _body -> ()
-    | Error err ->
-      let err_str = Error.to_string_hum err in
-      reject_order req w "%s" err_str ;
-      Log.error log_bitmex "%s" err_str
-  end
+  REST.Order.submit_bulk
+    ~log:log_bitmex
+    ~testnet:!use_testnet ~key ~secret [order] >>| function
+  | Ok _body -> ()
+  | Error err ->
+    let err_str = Error.to_string_hum err in
+    reject_order req w "%s" err_str ;
+    Log.error log_bitmex "%s" err_str
 
 let submit_new_single_order addr w msg =
   let req = DTC.default_submit_new_single_order () in
@@ -1033,7 +1031,115 @@ let submit_new_single_order addr w msg =
       "parent order stored" ;
     Log.debug log_dtc "Stored parent order"
   end
-  else submit_order w ~key ~secret req stop_exec_inst
+  else don't_wait_for (submit_order w ~key ~secret req stop_exec_inst)
+
+let reject_cancel_replace_order (req : DTC.Cancel_replace_order.t) addr w k =
+  let rej = DTC.default_order_update () in
+  rej.total_num_messages <- Some 1l ;
+  rej.message_number <- Some 1l ;
+  rej.order_update_reason <- Some `order_cancel_replace_rejected ;
+  rej.client_order_id <- req.client_order_id ;
+  rej.server_order_id <- req.server_order_id ;
+  rej.order_type <- req.order_type ;
+  rej.price1 <- req.price1 ;
+  rej.price2 <- req.price2 ;
+  rej.order_quantity <- req.quantity ;
+  rej.time_in_force <- req.time_in_force ;
+  rej.good_till_date_time <- req.good_till_date_time ;
+  Printf.ksprintf begin fun info_text ->
+    rej.info_text <- Some info_text ;
+    write_message w `order_update DTC.gen_order_update rej ;
+    Log.debug log_dtc "-> [%s] Cancel Replace Rejected: %s" addr info_text
+  end k
+
+let amend_order addr w req key secret orderID ordType =
+  let price1 = if req.DTC.Cancel_replace_order.price1_is_set = Some true then req.price1 else None in
+  let price2 = if req.price2_is_set = Some true then req.price2 else None in
+  let price, stopPx = OrderType.to_price_stopPx ?p1:price1 ?p2:price2 ordType in
+  let amend = REST.Order.create_amend
+    ?clOrdID:req.client_order_id
+    ?leavesQty:(Option.map req.quantity ~f:Float.to_int)
+    ?price
+    ?stopPx
+    ~orderID () in
+  REST.Order.amend_bulk ~log:log_bitmex ~testnet:!use_testnet ~key ~secret [amend] >>| function
+  | Ok body ->
+    Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body
+  | Error err ->
+    let err_str = Error.to_string_hum err in
+    reject_cancel_replace_order req addr w "%s" err_str;
+    Log.error log_bitmex "%s" err_str
+
+let cancel_replace_order addr w msg =
+  let req = DTC.parse_cancel_replace_order msg in
+  let { Connection.key; secret; order } = Connection.find_exn addr in
+  Log.debug log_dtc "<- [%s] Cancel Order" addr ;
+  if Option.is_some req.order_type then
+    reject_cancel_replace_order req addr w
+      "Modification of order type is not supported by BitMEX"
+  else if Option.is_some req.time_in_force then
+    reject_cancel_replace_order req addr w
+      "Modification of time in force is not supported by BitMEX"
+  else match req.server_order_id with
+    | None ->
+      reject_cancel_replace_order req addr w
+        "No server order id set"
+    | Some orderID ->
+      match Uuid.Table.find order (Uuid.of_string orderID) with
+      | None ->
+        reject_cancel_replace_order req addr w
+          "internal error: order id %s not found in db" orderID
+      | Some o ->
+        let ordType = RespObj.string_exn o "ordType" |> OrderType.of_string in
+        don't_wait_for (amend_order addr w req key secret orderID ordType)
+
+let reject_cancel_order (req : DTC.Cancel_order.t) addr w k =
+  let rej = DTC.default_order_update () in
+  rej.total_num_messages <- Some 1l ;
+  rej.message_number <- Some 1l ;
+  rej.order_update_reason <- Some `order_cancel_rejected ;
+  rej.client_order_id <- req.client_order_id ;
+  rej.server_order_id <- req.server_order_id ;
+  Printf.ksprintf begin fun info_text ->
+    rej.info_text <- Some info_text ;
+    write_message w `order_update DTC.gen_order_update rej ;
+    Log.debug log_dtc "-> [%s] Cancel Rejected: %s" addr info_text
+  end k
+
+let cancel_solo_order req addr w key secret orderID =
+  REST.Order.cancel
+    ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~orderIDs:[orderID] () >>| function
+  | Ok body ->
+    Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body
+  | Error err ->
+    let err_str = Error.to_string_hum err in
+    reject_cancel_order req addr w "%s" err_str;
+    Log.error log_bitmex "%s" err_str
+
+let cancel_linked_orders req addr w key secret linkID =
+  let filter = `Assoc ["clOrdLinkID", `String linkID] in
+  REST.Order.cancel_all
+    ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
+  | Ok body ->
+    Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body
+  | Error err ->
+    let err_str = Error.to_string_hum err in
+    reject_cancel_order req addr w "%s" err_str;
+    Log.error log_bitmex "%s" err_str
+
+let cancel_order addr w msg =
+  let req = DTC.parse_cancel_order msg in
+  let { Connection.key; secret; parents } = Connection.find_exn addr in
+  Log.debug log_dtc "<- [%s] Cancel Order" addr ;
+  match req.server_order_id,
+        Option.(req.client_order_id >>= String.Table.find parents) with
+  | Some orderID, None ->
+    let orderID = Uuid.of_string orderID in
+    don't_wait_for (cancel_solo_order req addr w key secret orderID)
+  | Some orderID, Some linkID ->
+    don't_wait_for (cancel_linked_orders req addr w key secret linkID)
+  | _ ->
+    reject_cancel_order req addr w "Fatal: Missing order id"
 
 (* let process addr w msg_cs scratchbuf = *)
 (*   let addr_str = Socket.Address.Inet.to_string addr in *)
@@ -1271,133 +1377,6 @@ let submit_new_single_order addr w msg =
 (*             "order %s/%s do not match stored parent %s (expected %s)" *)
 (*             m.cli_ord_id_1 m.cli_ord_id_2 p.cli_ord_id m.parent *)
 (*       end *)
-
-(*   | Some CancelReplaceOrder -> *)
-(*     let open Trading.Order in *)
-(*     let reject m k = *)
-(*       let order_update_cs = Cstruct.of_bigarray ~off:0 *)
-(*           ~len:Update.sizeof_cs scratchbuf *)
-(*       in *)
-(*       Printf.ksprintf begin fun reason -> *)
-(*         Update.write *)
-(*           ~nb_msgs:1 *)
-(*           ~msg_number:1 *)
-(*           ~reason:Cancel_replace_rejected *)
-(*           ~cli_ord_id:m.Replace.cli_ord_id *)
-(*           ~srv_ord_id:m.srv_ord_id *)
-(*           ?ord_type:m.Replace.ord_type *)
-(*           ~p1:m.Replace.p1 *)
-(*           ~p2:m.Replace.p2 *)
-(*           ~order_qty:m.Replace.qty *)
-(*           ?tif:m.Replace.tif *)
-(*           ~good_till_ts:m.Replace.good_till_ts *)
-(*           ~info_text:reason *)
-(*           order_update_cs; *)
-(*         Writer.write_cstruct w order_update_cs; *)
-(*         Log.debug log_dtc "-> [%s] CancelReplaceRej: %s" addr_str reason *)
-(*       end k *)
-(*     in *)
-(*     let m = Replace.read msg_cs in *)
-(*     let { addr_str; key; secret; order } = Option.value_exn client in *)
-(*     Log.debug log_dtc "<- [%s] %s" addr_str (Replace.show m); *)
-(*     let cancel_order_exn order = *)
-(*       let orderID = RespObj.string_exn order "orderID" in *)
-(*       let ord_type = RespObj.string_exn order "ordType" in *)
-(*       let ord_type = ord_type_of_string ord_type in *)
-(*       let uri = Uri.with_path !base_uri "/api/v1/order" in *)
-(*       let p1 = if m.p1_set then Some m.p1 else None in *)
-(*       let p2 = if m.p2_set then Some m.p2 else None in *)
-(*       let body = ([Some ("orderID", `String orderID); *)
-(*                    if m.Replace.qty <> 0. then Some ("orderQty", `Float m.Replace.qty) else None; *)
-(*                   ] |> List.filter_opt) *)
-(*                  @ price_fields_of_dtc ord_type ?p1 ?p2 *)
-(*       in *)
-(*       let body_str = Yojson.Safe.to_string @@ `Assoc body in *)
-(*       let body = Body.of_string body_str in *)
-(*       Log.debug log_bitmex "-> %s" body_str; *)
-(*       Rest.call ~name:"cancel" ~f:begin fun uri -> *)
-(*         Client.put *)
-(*           ~chunked:false ~body *)
-(*           ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `PUT uri) *)
-(*             uri *)
-(*       end uri >>| function *)
-(*       | Ok body -> *)
-(*         Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body *)
-(*       | Error err -> *)
-(*         let err_str = Error.to_string_hum err in *)
-(*         reject m "%s" err_str; *)
-(*         Log.error log_bitmex "%s" err_str *)
-(*     in *)
-(*     if Option.is_some m.Replace.ord_type then *)
-(*       reject m "Modification of order type is not supported by BitMEX" *)
-(*     else if Option.is_some m.Replace.tif then *)
-(*       reject m "Modification of time in force is not supported by BitMEX" *)
-(*     else *)
-(*       let hex_srv_ord_id = uuid_of_b64 m.srv_ord_id in *)
-(*       let on_exn _ = *)
-(*         reject m "internal error when trying to cancel cli=%s srv=%s" m.cli_ord_id hex_srv_ord_id; *)
-(*         Deferred.unit *)
-(*       in *)
-(*       begin *)
-(*         match Uuid.Table.find order @@ Uuid.of_string hex_srv_ord_id with *)
-(*         | None -> reject m "internal error: %s not found in db" m.srv_ord_id *)
-(*         | Some o -> don't_wait_for @@ eat_exn ~on_exn ~log:log_bitmex (fun () -> cancel_order_exn o) *)
-(*       end *)
-
-(*   | Some CancelOrder -> *)
-(*     let open Trading.Order in *)
-(*     let reject m k = *)
-(*       let order_update_cs = Cstruct.of_bigarray ~off:0 *)
-(*           ~len:Update.sizeof_cs scratchbuf *)
-(*       in *)
-(*       Printf.ksprintf begin fun reason -> *)
-(*           Update.write *)
-(*             ~nb_msgs:1 *)
-(*             ~msg_number:1 *)
-(*             ~reason:Cancel_rejected *)
-(*             ~cli_ord_id:m.Cancel.cli_ord_id *)
-(*             ~srv_ord_id:m.srv_ord_id *)
-(*             ~info_text:reason *)
-(*             order_update_cs; *)
-(*           Writer.write_cstruct w order_update_cs; *)
-(*           Log.debug log_dtc "-> [%s] CancelOrderRej: %s" addr_str reason *)
-(*       end k *)
-(*     in *)
-(*     let m = Cancel.read msg_cs in *)
-(*     let hex_srv_ord_id = uuid_of_b64 m.srv_ord_id in *)
-(*     let { addr_str; key; secret; parents; } = Option.value_exn client in *)
-(*     Log.debug log_dtc "<- [%s] Cancelorder cli=%s srv=%s" addr_str m.cli_ord_id hex_srv_ord_id; *)
-(*     let cancel_order_exn = function *)
-(*       | None -> begin *)
-(*         let uri = Uri.with_path !base_uri "/api/v1/order" in *)
-(*         let body_str = `Assoc ["orderID", `String hex_srv_ord_id] |> Yojson.Safe.to_string in *)
-(*         let body = Body.of_string body_str in *)
-(*         Client.delete *)
-(*           ~chunked:false ~body *)
-(*           ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `DELETE uri) *)
-(*           uri >>= function (resp, body) -> *)
-(*           Body.to_string body >>| fun body_str -> *)
-(*           Log.debug log_bitmex "<- %s" body_str *)
-(*         end *)
-(*       | Some linkId -> begin *)
-(*         let uri = Uri.with_path !base_uri "/api/v1/order/all" in *)
-(*         let body_str = `Assoc ["filter", `Assoc ["clOrdLinkID", `String linkId]] |> Yojson.Safe.to_string in *)
-(*         let body = Body.of_string body_str in *)
-(*         Client.delete *)
-(*           ~chunked:false ~body *)
-(*           ~headers:(Rest.mk_headers ~key ~secret ~data:body_str `DELETE uri) *)
-(*           uri >>= function (resp, body) -> *)
-(*           Body.to_string body >>| fun body_str -> *)
-(*           Log.debug log_bitmex "<- %s" body_str *)
-(*         end *)
-(*     in *)
-(*     let on_exn _ = *)
-(*       reject m "exception raised while trying to cancel cli=%s srv=%s" m.cli_ord_id m.srv_ord_id; *)
-(*       Deferred.unit *)
-(*     in *)
-(*     let parent = String.Table.find parents m.cli_ord_id in *)
-(*     don't_wait_for @@ eat_exn ~on_exn ~log:log_bitmex *)
-(*       (fun () -> cancel_order_exn parent) *)
 
 (*   | Some _ *)
 (*   | None -> *)
