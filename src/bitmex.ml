@@ -553,122 +553,120 @@ type subscribe_msg =
 
 let client_ws_r, client_ws_w = Pipe.create ()
 
-let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position; } as c) =
-  let order_partial_done = Ivar.create () in
-  let margin_partial_done = Ivar.create () in
-  let position_partial_done = Ivar.create () in
+let process_orders { Connection.addr ; order } partial_iv action orders =
+  let orders = List.map orders ~f:RespObj.of_json in
+  List.iter orders ~f:begin fun o ->
+    let oid = RespObj.string_exn o "orderID" in
+    let oid = Uuid.of_string oid in
+    match action with
+    | WS.Response.Update.Delete ->
+      Uuid.Table.remove order oid;
+      Log.debug log_bitmex "<- [%s] order delete" addr
+    | Insert
+    | Partial ->
+      Uuid.Table.set order ~key:oid ~data:o;
+      Log.debug log_bitmex "<- [%s] order insert/partial" addr
+    | Update ->
+      if Ivar.is_full partial_iv then begin
+        let data = match Uuid.Table.find order oid with
+          | None -> o
+          | Some old_o -> RespObj.merge old_o o
+        in
+        Uuid.Table.set order ~key:oid ~data;
+        Log.debug log_bitmex "<- [%s] order update" addr
+      end
+  end;
+  if action = Partial then Ivar.fill_if_empty partial_iv ()
 
-  let process_orders action orders =
-    let orders = List.map orders ~f:RespObj.of_json in
-    List.iter orders ~f:begin fun o ->
-      let oid = RespObj.string_exn o "orderID" in
-      let oid = Uuid.of_string oid in
-      match action with
-      | WS.Response.Update.Delete ->
-        Uuid.Table.remove order oid;
-        Log.debug log_bitmex "<- [%s] order delete" addr
-      | Insert
-      | Partial ->
-        Uuid.Table.set order ~key:oid ~data:o;
-        Log.debug log_bitmex "<- [%s] order insert/partial" addr
-      | Update ->
-        if Ivar.is_full order_partial_done then begin
-          let data = match Uuid.Table.find order oid with
-            | None -> o
-            | Some old_o -> RespObj.merge old_o o
-          in
-          Uuid.Table.set order ~key:oid ~data;
-          Log.debug log_bitmex "<- [%s] order update" addr
-        end
-    end;
-    if action = Partial then Ivar.fill_if_empty order_partial_done ()
-  in
-  let process_margins action margins =
-    let margins = List.map margins ~f:RespObj.of_json in
-    List.iteri margins ~f:begin fun i m ->
-      let a = RespObj.int_exn m "account" in
-      let c = RespObj.string_exn m "currency" in
-      match action with
-      | WS.Response.Update.Delete ->
-        IS.Table.remove margin (a, c);
-        Log.debug log_bitmex "<- [%s] margin delete" addr
-      | Insert
-      | Partial ->
+let process_margins { Connection.addr ; w ; margin } partial_iv action margins =
+  let margins = List.map margins ~f:RespObj.of_json in
+  List.iteri margins ~f:begin fun i m ->
+    let a = RespObj.int_exn m "account" in
+    let c = RespObj.string_exn m "currency" in
+    match action with
+    | WS.Response.Update.Delete ->
+      IS.Table.remove margin (a, c);
+      Log.debug log_bitmex "<- [%s] margin delete" addr
+    | Insert
+    | Partial ->
+      IS.Table.set margin ~key:(a, c) ~data:m;
+      Log.debug log_bitmex "<- [%s] margin insert/partial" addr;
+      write_balance_update ~msg_number:1 ~nb_msgs:1 w m
+    | Update ->
+      if Ivar.is_full partial_iv then begin
+        let m = match IS.Table.find margin (a, c) with
+          | None -> m
+          | Some old_m -> RespObj.merge old_m m
+        in
         IS.Table.set margin ~key:(a, c) ~data:m;
-        Log.debug log_bitmex "<- [%s] margin insert/partial" addr;
-        write_balance_update ~msg_number:1 ~nb_msgs:1 w m
-      | Update ->
-        if Ivar.is_full margin_partial_done then begin
-          let m = match IS.Table.find margin (a, c) with
-            | None -> m
-            | Some old_m -> RespObj.merge old_m m
-          in
-          IS.Table.set margin ~key:(a, c) ~data:m;
-          write_balance_update ~msg_number:1 ~nb_msgs:1 w m ;
-          Log.debug log_bitmex "<- [%s] margin update" addr
-        end
-    end;
-    if action = Partial then Ivar.fill_if_empty margin_partial_done ()
-  in
-  let process_positions action positions =
-    let positions = List.map positions ~f:RespObj.of_json in
-    List.iter positions ~f:begin fun p ->
-      let a = RespObj.int_exn p "account" in
-      let s = RespObj.string_exn p "symbol" in
-      match action with
-      | WS.Response.Update.Delete ->
-        IS.Table.remove position (a, s);
-        Log.debug log_bitmex "<- [%s] position delete" addr
-      | Insert | Partial ->
+        write_balance_update ~msg_number:1 ~nb_msgs:1 w m ;
+        Log.debug log_bitmex "<- [%s] margin update" addr
+      end
+  end;
+  if action = Partial then Ivar.fill_if_empty partial_iv ()
+
+let process_positions { Connection.addr ; w ; position } partial_iv action positions =
+  let positions = List.map positions ~f:RespObj.of_json in
+  List.iter positions ~f:begin fun p ->
+    let a = RespObj.int_exn p "account" in
+    let s = RespObj.string_exn p "symbol" in
+    match action with
+    | WS.Response.Update.Delete ->
+      IS.Table.remove position (a, s);
+      Log.debug log_bitmex "<- [%s] position delete" addr
+    | Insert | Partial ->
+      IS.Table.set position ~key:(a, s) ~data:p;
+      if RespObj.bool_exn p "isOpen" then begin
+        write_position_update ~nb_msgs:1 ~msg_number:1 w p ;
+        Log.debug log_bitmex "<- [%s] position insert/partial" addr
+      end
+    | Update ->
+      if Ivar.is_full partial_iv then begin
+        let old_p, p = match IS.Table.find position (a, s) with
+          | None -> None, p
+          | Some old_p -> Some old_p, RespObj.merge old_p p
+        in
         IS.Table.set position ~key:(a, s) ~data:p;
-        if RespObj.bool_exn p "isOpen" then begin
+        match old_p with
+        | Some old_p when RespObj.bool_exn old_p "isOpen" ->
           write_position_update ~nb_msgs:1 ~msg_number:1 w p ;
-          Log.debug log_bitmex "<- [%s] position insert/partial" addr
-        end
-      | Update ->
-        if Ivar.is_full position_partial_done then begin
-          let old_p, p = match IS.Table.find position (a, s) with
-            | None -> None, p
-            | Some old_p -> Some old_p, RespObj.merge old_p p
-          in
-          IS.Table.set position ~key:(a, s) ~data:p;
-          match old_p with
-          | Some old_p when RespObj.bool_exn old_p "isOpen" ->
-            write_position_update ~nb_msgs:1 ~msg_number:1 w p ;
-            Log.debug log_dtc "<- [%s] position update %s" addr s
-          | _ -> ()
-        end
-    end;
-    if action = Partial then Ivar.fill_if_empty position_partial_done ()
+          Log.debug log_dtc "<- [%s] position update %s" addr s
+        | _ -> ()
+      end
+  end;
+  if action = Partial then Ivar.fill_if_empty partial_iv ()
+
+let process_execs { Connection.addr ; w } action execs =
+  let fold_f i e =
+    let symbol = RespObj.string_exn e "symbol" in
+    match action with
+    | WS.Response.Update.Insert ->
+      Log.debug log_bitmex "<- [%s] exec %s" addr symbol;
+      if write_order_update ~nb_msgs:1 ~msg_number:1 w e then succ i else i
+    | _ -> i
   in
-  let process_execs action execs =
-    let fold_f i e =
-      let symbol = RespObj.string_exn e "symbol" in
-      match action with
-      | WS.Response.Update.Insert ->
-        Log.debug log_bitmex "<- [%s] exec %s" addr symbol;
-        if write_order_update ~nb_msgs:1 ~msg_number:1 w e then succ i else i
-      | _ -> i
-    in
-    let execs = List.map execs ~f:RespObj.of_json in
-    let nb_execs = List.fold_left execs ~init:0 ~f:fold_f in
-    if nb_execs > 0 then Log.debug log_dtc "-> [%s] OrderUpdate %d" addr nb_execs
-  in
+  let execs = List.map execs ~f:RespObj.of_json in
+  let nb_execs = List.fold_left execs ~init:0 ~f:fold_f in
+  if nb_execs > 0 then Log.debug log_dtc "-> [%s] OrderUpdate %d" addr nb_execs
+
+let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position; } as c) =
+  let order_iv = Ivar.create () in
+  let margin_iv = Ivar.create () in
+  let position_iv = Ivar.create () in
+
   let on_update { WS.Response.Update.table; action; data } =
     match table, action, data with
-      | "order", action, orders -> process_orders action orders
-      | "margin", action, margins -> process_margins action margins
-      | "position", action, positions -> process_positions action positions
-      | "execution", action, execs -> process_execs action execs
+      | "order", action, orders -> process_orders c order_iv action orders
+      | "margin", action, margins -> process_margins c margin_iv action margins
+      | "position", action, positions -> process_positions c position_iv action positions
+      | "execution", action, execs -> process_execs c action execs
       | table, _, _ -> Log.error log_bitmex "Unknown table %s" table
   in
   Pipe.write client_ws_w @@ Subscribe c >>= fun () ->
   don't_wait_for @@ Monitor.handle_errors
     (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws_r ~f:on_update)
     (fun exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn);
-  Deferred.all_unit (List.map ~f:Ivar.read [order_partial_done;
-                                            position_partial_done;
-                                            margin_partial_done])
+  Deferred.all_unit (List.map ~f:Ivar.read [order_iv; position_iv; margin_iv])
 
 let encoding_request addr w req =
   Log.debug log_dtc "<- [%s] Encoding Request" addr ;
@@ -683,6 +681,7 @@ let accept_logon_request addr w req client stop_exec_inst trading =
     | Error msg -> false, Printf.sprintf "Trading disabled: %s" msg
   in
   let r = DTC.default_logon_response () in
+  r.protocol_version <- Some 7l ;
   r.server_name <- Some "BitMEX" ;
   r.result <- Some `logon_success ;
   r.result_text <- Some result_text ;
@@ -709,8 +708,8 @@ let accept_logon_request addr w req client stop_exec_inst trading =
   in
   ignore @@ String.Table.iter Instrument.active ~f:on_instrument
 
-let setup_client_ws client apikey =
-  let ws_initialized = client_ws client in
+let setup_client_ws conn apikey =
+  let ws_initialized = client_ws conn in
   let ws_ok = choice ws_initialized (fun () ->
       Log.info log_dtc "BitMEX accepts API key %s" apikey ;
       Result.return "API key valid."
@@ -881,7 +880,7 @@ let reject_market_depth_request ?id addr w k =
       DTC.gen_market_depth_reject rej
   end k
 
-let write_market_depth_snapshot ?id addr w ~symbol ~exchange ~num_levels =
+let write_market_depth_snapshot ?id addr w ~symbol ~num_levels =
   let bids = Books.get_bids symbol in
   let asks = Books.get_asks symbol in
   let snap = DTC.default_market_depth_snapshot_level () in
@@ -932,7 +931,7 @@ let market_depth_request addr w msg =
     end ;
     Int32.Table.remove rev_subs_depth id
   | Some `snapshot, id, Some symbol, Some exchange ->
-    write_market_depth_snapshot ?id addr w ~symbol ~exchange ~num_levels
+    write_market_depth_snapshot ?id addr w ~symbol ~num_levels
   | Some `subscribe, Some id, Some symbol, Some exchange ->
     Log.debug log_dtc "<- [%s] Market Data Request %ld %s %s"
       addr id symbol exchange ;
@@ -945,7 +944,7 @@ let market_depth_request addr w msg =
       | _ ->
         String.Table.set subs_depth symbol id ;
         Int32.Table.set rev_subs_depth id symbol ;
-        write_market_depth_snapshot ~id addr w ~symbol ~exchange ~num_levels
+        write_market_depth_snapshot ~id addr w ~symbol ~num_levels
     end
   | _ ->
     reject_market_data_request addr w "Market Data Request: wrong request"
@@ -1749,15 +1748,15 @@ let on_ws_msg to_ws_w my_uuid msg =
     end
     | _ -> ()
 
+let subscribe_client to_ws_w ({ Connection.addr; key; secret } as c) =
+  let id = Uuid.create () in
+  let id_str = Uuid.to_string id in
+  c.ws_uuid <- id;
+  Pipe.write to_ws_w Bmex_ws.MD.(to_yojson (subscribe ~id:id_str ~topic:addr))
+
 let bitmex_ws () =
   let open Bmex_ws in
   let to_ws, to_ws_w = Pipe.create () in
-  let subscribe_client ({ Connection.addr; key; secret } as c) =
-    let id = Uuid.create () in
-    let id_str = Uuid.to_string id in
-    c.ws_uuid <- id;
-    Pipe.write to_ws_w MD.(to_yojson (subscribe ~id:id_str ~topic:addr))
-  in
   let my_uuid = Uuid.(create () |> to_string) in
   let connected = Condition.create () in
   let rec resubscribe () =
@@ -1765,7 +1764,7 @@ let bitmex_ws () =
     Pipe.write to_ws_w @@ MD.to_yojson @@
     MD.subscribe ~id:my_uuid ~topic:my_topic >>= fun () ->
     Deferred.List.iter (Connection.to_alist ())
-      ~how:`Sequential ~f:(fun (_addr, c) -> subscribe_client c) >>=
+      ~how:`Sequential ~f:(fun (_addr, c) -> subscribe_client to_ws_w c) >>=
     resubscribe
   in
   don't_wait_for @@ resubscribe ();
@@ -1773,7 +1772,7 @@ let bitmex_ws () =
       ~testnet:!use_testnet ~md:true ~topics:[] () in
   don't_wait_for begin
     Pipe.iter client_ws_r ~f:begin function
-      | Subscribe c -> subscribe_client c
+      | Subscribe c -> subscribe_client to_ws_w c
       | Unsubscribe (id, topic) ->
         Pipe.write to_ws_w @@ MD.to_yojson @@
         MD.unsubscribe ~id:(Uuid.to_string id) ~topic
