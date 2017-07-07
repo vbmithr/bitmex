@@ -1,6 +1,5 @@
-(executable
- ((name bitmex)
-  (public_name bitmex)
-  (modules bitmex)
+(executables
+ ((names (bitmex bitmex_data))
+  (public_names (bitmex bitmex-data))
   (preprocess (pps (ppx_sexp_conv)))
-  (libraries (dtc-pb bmex-rest bmex-ws))))
+  (libraries (dtc-pb bmex-rest bmex-ws tick leveldb))))
