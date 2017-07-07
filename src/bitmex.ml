@@ -423,7 +423,6 @@ let send_heartbeat { Connection.addr; w; dropped } ival =
   | Error _ -> Log.error log_dtc "-/-> %s HB" addr
   | Ok _ -> ()
 
-
 let write_order_update ~nb_msgs ~msg_number w e =
   let invalid_arg' execType ordStatus =
     invalid_arg Printf.(sprintf "write_order_update: execType=%s, ordStatus=%s" execType ordStatus)
@@ -1041,7 +1040,7 @@ let historical_order_fills_request addr w msg =
     ] end
   in
   don't_wait_for begin
-    REST.trade_history
+    REST.Execution.trade_history
       ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
     | Ok body ->
       send_historical_order_fills_response ?request_id:req.request_id addr w body
@@ -1783,7 +1782,9 @@ let bitmex_ws () =
         ~continue_on_error:true ws ~f:(on_ws_msg to_ws_w my_uuid))
     (fun exn -> Log.error log_bitmex "%s" @@ Exn.to_string exn)
 
-let main tls testnet port daemon pidfile logfile loglevel ll_ws ll_dtc ll_bitmex crt_path key_path =
+let main
+    tls testnet port daemon pidfile logfile
+    loglevel ll_ws ll_dtc ll_bitmex crt_path key_path () =
   let pidfile = if testnet then add_suffix pidfile "_testnet" else pidfile in
   let logfile = if testnet then add_suffix logfile "_testnet" else logfile in
   let run server =
@@ -1808,7 +1809,7 @@ let main tls testnet port daemon pidfile logfile loglevel ll_ws ll_dtc ll_bitmex
   Log.set_level log_ws @@ loglevel_of_int ll_ws;
 
   if daemon then Daemon.daemonize ~cd:"." ();
-  don't_wait_for begin
+  stage begin fun `Scheduler_started ->
     Lock_file.create_exn pidfile >>= fun () ->
     Writer.open_file ~append:true logfile >>= fun log_writer ->
     Log.(set_output log_dtc Output.[stderr (); writer `Text log_writer]);
@@ -1816,8 +1817,7 @@ let main tls testnet port daemon pidfile logfile loglevel ll_ws ll_dtc ll_bitmex
     Log.(set_output log_ws Output.[stderr (); writer `Text log_writer]);
     conduit_server ~tls ~crt_path ~key_path >>= fun server ->
     loop_log_errors ~log:log_dtc (fun () -> run server)
-  end;
-  never_returns @@ Scheduler.go ()
+  end
 
 let command =
   let spec =
@@ -1836,6 +1836,6 @@ let command =
     +> flag "-crt-file" (optional_with_default "ssl/bitsouk.com.crt" string) ~doc:"filename crt file to use (TLS)"
     +> flag "-key-file" (optional_with_default "ssl/bitsouk.com.key" string) ~doc:"filename key file to use (TLS)"
   in
-  Command.basic ~summary:"BitMEX bridge" spec main
+  Command.Staged.async ~summary:"BitMEX bridge" spec main
 
 let () = Command.run command
