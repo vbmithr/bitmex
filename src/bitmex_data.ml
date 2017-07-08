@@ -39,7 +39,10 @@ let load_instruments () =
   in
   REST.Instrument.active_and_indices
     ~buf ~log:(Lazy.force log) ~testnet:!use_testnet () >>|
-  Or_error.map ~f:(List.iter ~f:iter_instrument)
+  Or_error.map ~f:begin fun (resp, instrs) ->
+    List.iter instrs ~f:iter_instrument ;
+    resp
+  end
 
 let mk_store_trade_in_db () =
   let tss = String.Table.create () in
@@ -63,24 +66,52 @@ let mk_store_trade_in_db () =
 
 let store_trade_in_db = mk_store_trade_in_db ()
 
-let rec pump startTime period =
+module RateLimit = struct
+  type t = {
+    limit : int ;
+    remaining : int ;
+    reset : Time_ns.t ;
+  }
+
+  let create ~limit ~remaining ~reset =
+    { limit ; remaining ; reset }
+
+  let of_headers h =
+    match Cohttp.Header.get h "x-ratelimit-limit",
+          Cohttp.Header.get h "x-ratelimit-remaining",
+          Cohttp.Header.get h "x-ratelimit-reset" with
+    | Some limit, Some remaining, Some reset ->
+      let limit = Int.of_string limit in
+      let remaining = Int.of_string remaining in
+      let reset =
+        Time_ns.of_int_ns_since_epoch (Int.of_string reset * 1_000_000_000) in
+      create limit remaining reset
+    | _ -> invalid_arg "RateLimit.of_headers"
+end
+
+let rec pump startTime =
   REST.Trade.get ~testnet:!use_testnet ~count:500 ~startTime () >>= function
   | Error err ->
     error "pump: %s" @@ Error.to_string_hum err ;
     Deferred.unit
-  | Ok trades ->
+  | Ok (resp, trades) ->
     let nb_trades, last_ts =
       List.fold_left ~init:(0, Time_ns.epoch) trades ~f:begin fun (nb_trades, last_ts) t ->
         store_trade_in_db t;
         succ nb_trades, t.timestamp
       end in
     let last_ts_str = Time_ns.to_string last_ts in
-    let period =
-      if nb_trades = 500 then period else Time_ns.Span.of_int_sec 600 in
-    debug "pumped %d trades up to to %s" nb_trades last_ts_str;
+    let { RateLimit.limit ; remaining ; reset } = RateLimit.of_headers resp.headers in
+    let continue_at =
+      match nb_trades, remaining with
+      | n, _ when n < 500 -> Clock_ns.after (Time_ns.Span.of_int_sec 600)
+      | _, r when r < 2 -> Clock_ns.at reset
+      | _ -> Deferred.unit
+    in
+    debug "pumped %d trades up to to %s (%d/%d)" nb_trades last_ts_str remaining limit ;
     if not !dry_run then Out_channel.write_all (db_path "start") ~data:last_ts_str;
-    Clock_ns.after period >>= fun () ->
-    pump Time_ns.(add last_ts @@ Span.of_int_ns 1) period
+    continue_at >>= fun () ->
+    pump Time_ns.(add last_ts @@ Span.of_int_ns 1)
 
 (* A DTC Historical Price Server. *)
 
@@ -143,6 +174,9 @@ let span_of_interval = function
   | `interval_5_seconds -> Time_ns.Span.of_int_sec 5
   | `interval_tick -> Time_ns.Span.zero
 
+let max_int_value = Int64.of_int_exn Int.max_value
+let start_key = Bytes.create 8
+
 let accept_historical_price_data_request
     w (req : DTC.Historical_price_data_request.t) db symbol =
   (* SC sometimes uses negative timestamps. Correcting this. *)
@@ -157,13 +191,17 @@ let accept_historical_price_data_request
   (* Now sending tick responses. *)
   let start_date_time =
     Int64.(max 0L (Option.value_map req.start_date_time ~default:0L ~f:(( * ) 1_000_000_000L))) in
-  let end_date_time =
-    Option.value_map req.end_date_time
-      ~default:Int64.max_value ~f:Int64.(( * ) 1_000_000_000L) in
-  let start_key = Bytes.create 8 in
+  let end_date_time = Option.value_map req.end_date_time
+      ~default:max_int_value ~f:begin function
+      | 0L -> max_int_value
+      | v -> Int64.(v * 1_000_000_000L)
+    end in
   Binary_packing.pack_signed_64_big_endian start_key 0 start_date_time ;
-  (* Time_ns.(info "Starting streaming %s from %s to %s, interval = %s" *)
-  (*            symbol (to_string m.start_ts) (to_string m.end_ts) (Span.to_string record_interval)); *)
+  info "Starting streaming %s from %Ld to %Ld"
+    symbol
+    (* Time_ns.(of_int_ns_since_epoch (Int64.to_int_exn start_date_time) |> to_string) *)
+    (* Time_ns.(of_int_ns_since_epoch (Int64.to_int_exn end_date_time) |> to_string) ; *)
+    start_date_time end_date_time ;
   let nb_streamed = ref 0 in
   (* if m.record_interval = 0 then begin (\* streaming tick responses *\) *)
   let resp = DTC.default_historical_price_data_tick_record_response () in
@@ -216,7 +254,11 @@ let accept_historical_price_data_request
 
 let historical_price_data_request addr w msg =
   let req = DTC.parse_historical_price_data_request msg in
-  debug "<- [%s] Historical Data Request" addr ;
+  begin match req.symbol, req.exchange with
+    | Some symbol, Some exchange ->
+      debug "<- [%s] Historical Data Request %s %s" addr symbol exchange ;
+    | _ -> ()
+  end ;
   let record_span =
     Option.value_map ~default:Time_ns.Span.zero
       ~f:span_of_interval req.record_interval in
@@ -303,30 +345,31 @@ let dtcserver ~server ~port =
       Reader.(read_one_chunk_at_a_time r ~handle_chunk:(handle_chunk 0))
     end
   in
-  let on_handler_error_f addr exn =
-    error "on_handler_error (%s): %s"
-      Socket.Address.(to_string addr) Exn.(to_string exn)
+  let on_handler_error_f addr = function
+    | Exit -> ()
+    | exn ->
+      error "on_handler_error (%s): %s"
+        Socket.Address.(to_string addr) Exn.(to_string exn)
   in
   Conduit_async.serve
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.on_port port) server_fun
 
-let run port start period =
+let run port start no_pump =
   load_instruments () >>= function
   | Error err -> raise (Error.to_exn err)
-  | Ok () ->
+  | Ok _resp ->
     info "Data server starting";
     dtcserver ~server:`TCP ~port >>= fun server ->
     Deferred.all_unit [
       Tcp.Server.close_finished server ;
-      pump start period
+      if not no_pump then pump start else Deferred.unit
     ]
 
-let main dry_run' testnet start period port daemon datadir' pidfile logfile loglevel () =
+let main dry_run' no_pump testnet start port daemon datadir' pidfile logfile loglevel () =
   dry_run := dry_run';
   let pidfile = if testnet then add_suffix pidfile "_testnet" else pidfile in
   let logfile = if testnet then add_suffix logfile "_testnet" else logfile in
-  let period = Time_ns.Span.of_int_sec period in
 
   (* begin initialization code *)
   if testnet then begin
@@ -355,7 +398,7 @@ let main dry_run' testnet start period port daemon datadir' pidfile logfile logl
     Lock_file.create_exn pidfile >>= fun () ->
     Writer.open_file ~append:true logfile >>= fun log_writer ->
     set_output Log.Output.[stderr (); writer `Text log_writer];
-    run port start period
+    run port start no_pump
   end
 
 let command =
@@ -363,9 +406,9 @@ let command =
     let open Command.Spec in
     empty
     +> flag "-dry-run" no_arg ~doc:" Do not write trades in DBs"
+    +> flag "-no-pump" no_arg ~doc:" Do not pump trades"
     +> flag "-testnet" no_arg ~doc:" Use testnet"
     +> flag "-start" (optional float) ~doc:"float Start gathering history N days in the past (default: use start file)"
-    +> flag "-period" (optional_with_default 5 int) ~doc:"seconds Period for HTTP GETs (5)"
     +> flag "-port" (optional_with_default 5568 int) ~doc:"int TCP port to use (5568)"
     +> flag "-daemon" no_arg ~doc:" Run as a daemon"
     +> flag "-datadir" (optional_with_default "data" string) ~doc:"path Where to store DBs (data)"
