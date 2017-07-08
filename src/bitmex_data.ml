@@ -106,6 +106,7 @@ let accept_logon_request addr w req =
   r.server_name <- Some "BitMEX Data" ;
   r.result <- Some `logon_success ;
   r.result_text <- Some "OK" ;
+  r.symbol_exchange_delimiter <- Some "-" ;
   r.historical_price_data_supported <- Some true ;
   r.one_historical_price_data_request_per_connection <- Some true ;
   write_message w `logon_response DTC.gen_logon_response r ;

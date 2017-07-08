@@ -684,6 +684,7 @@ let accept_logon_request addr w req client stop_exec_inst trading =
   r.server_name <- Some "BitMEX" ;
   r.result <- Some `logon_success ;
   r.result_text <- Some result_text ;
+  r.symbol_exchange_delimiter <- Some "-" ;
   r.security_definitions_supported <- Some true ;
   r.market_data_supported <- Some true ;
   r.historical_price_data_supported <- Some false ;
