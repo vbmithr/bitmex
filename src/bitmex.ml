@@ -1043,7 +1043,7 @@ let historical_order_fills_request addr w msg =
   don't_wait_for begin
     REST.Execution.trade_history
       ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
-    | Ok body ->
+    | Ok (_resp, body) ->
       send_historical_order_fills_response ?request_id:req.request_id addr w body
     | Error err ->
       (* TODO: reject on error *)
@@ -1241,7 +1241,7 @@ let amend_order addr w req key secret orderID ordType =
     ?stopPx
     ~orderID () in
   REST.Order.amend_bulk ~log:log_bitmex ~testnet:!use_testnet ~key ~secret [amend] >>| function
-  | Ok body ->
+  | Ok (_resp, body) ->
     Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body
   | Error err ->
     let err_str = Error.to_string_hum err in
@@ -1287,7 +1287,7 @@ let reject_cancel_order (req : DTC.Cancel_order.t) addr w k =
 let cancel_solo_order req addr w key secret orderID =
   REST.Order.cancel
     ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~orderIDs:[orderID] () >>| function
-  | Ok body ->
+  | Ok (_resp, body) ->
     Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body
   | Error err ->
     let err_str = Error.to_string_hum err in
@@ -1298,7 +1298,7 @@ let cancel_linked_orders req addr w key secret linkID =
   let filter = `Assoc ["clOrdLinkID", `String linkID] in
   REST.Order.cancel_all
     ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
-  | Ok body ->
+  | Ok (_resp, body) ->
     Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body
   | Error err ->
     let err_str = Error.to_string_hum err in
