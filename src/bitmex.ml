@@ -1187,7 +1187,7 @@ let submit_order w ~key ~secret (req : DTC.Submit_new_single_order.t) stop_exec_
     Log.error log_bitmex "%s" err_str
 
 let submit_new_single_order addr w msg =
-  let req = DTC.default_submit_new_single_order () in
+  let req = DTC.parse_submit_new_single_order msg in
   let { Connection.key; secret;
         current_parent; stop_exec_inst } as conn = Connection.find_exn addr in
   Log.debug log_dtc "<- [%s] Submit New Single Order" addr ;
