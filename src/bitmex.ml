@@ -761,18 +761,18 @@ let security_definition_request addr w msg =
   let req = DTC.parse_security_definition_for_symbol_request msg in
   match req.request_id, req.symbol, req.exchange with
   | Some id, Some symbol, Some exchange ->
-    Log.debug log_dtc "<- [%s] Security Definition Request %s-%s" addr symbol exchange;
+    Log.debug log_dtc "<- [%s] Security Definition Request %s %s" addr symbol exchange;
     if !my_exchange <> exchange && not Instrument.(is_index symbol) then
-      security_definition_reject addr w id "No such symbol %s-%s" symbol exchange
+      security_definition_reject addr w id "No such symbol %s %s" symbol exchange
     else begin
       match Instrument.find symbol with
       | None ->
-        security_definition_reject addr w id "No such symbol %s-%s" symbol exchange
+        security_definition_reject addr w id "No such symbol %s %s" symbol exchange
       | Some { secdef } ->
         secdef.request_id <- Some id ;
         secdef.is_final_message <- Some true ;
         Log.debug log_dtc
-          "-> [%s] Security Definition Response %s-%s" addr symbol exchange;
+          "-> [%s] Security Definition Response %s %s" addr symbol exchange;
         write_message w `security_definition_response
           DTC.gen_security_definition_response secdef
     end
@@ -846,19 +846,19 @@ let market_data_request addr w msg =
     end ;
     Int32.Table.remove rev_subs id
   | Some `snapshot, id, Some symbol, Some exchange ->
-    Log.debug log_dtc "<- [%s] Market Data Request (snapshot) %s-%s"
+    Log.debug log_dtc "<- [%s] Market Data Request (snapshot) %s %s"
       addr symbol exchange ;
     let instr = Instrument.find_exn symbol in
     write_market_data_snapshot ?id addr w symbol instr ;
     Log.debug log_dtc "-> [%s] Market Data Snapshot %s %s" addr symbol exchange
   | Some `subscribe, Some id, Some symbol, Some exchange ->
-    Log.debug log_dtc "<- [%s] Market Data Request (subscribe) %ld %s-%s"
+    Log.debug log_dtc "<- [%s] Market Data Request (subscribe) %ld %s %s"
       addr id symbol exchange ;
     begin
       match Int32.Table.find rev_subs id with
       | Some symbol' when symbol <> symbol' ->
         reject_market_data_request addr w ~id
-          "Already subscribed to %s-%s with a different id (was %ld)"
+          "Already subscribed to %s %s with a different id (was %ld)"
           symbol exchange id
       | _ ->
         String.Table.set subs symbol id ;
@@ -939,7 +939,7 @@ let market_depth_request addr w msg =
       match Int32.Table.find rev_subs_depth id with
       | Some symbol' when symbol <> symbol' ->
         reject_market_data_request addr w ~id
-          "Already subscribed to %s-%s with a different id (was %ld)"
+          "Already subscribed to %s %s with a different id (was %ld)"
           symbol exchange id
       | _ ->
         String.Table.set subs_depth symbol id ;
