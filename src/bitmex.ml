@@ -1152,10 +1152,10 @@ let update_order (req : DTC.Submit_new_single_order.t) w ~status ~reason k =
 
 let submit_order w ~key ~secret (req : DTC.Submit_new_single_order.t) stop_exec_inst =
   let symbol = Option.value_exn ~message:"symbol is undefined" req.symbol in
-  let qty = Option.value_exn ~message:"qty is undefined" req.quantity in
-  let qty = Int.of_float @@ match req.buy_sell with
-    | Some `sell -> Float.neg qty
-    | _ -> qty in
+  let orderQty = Option.value_exn ~message:"qty is undefined" req.quantity in
+  let orderQty = Int.of_float @@ match req.buy_sell with
+    | Some `sell -> Float.neg orderQty
+    | _ -> orderQty in
   let ordType = Option.value ~default:`order_type_unset req.order_type in
   let timeInForce = Option.value ~default:`tif_unset req.time_in_force in
   let price, stopPx =
@@ -1175,7 +1175,7 @@ let submit_order w ~key ~secret (req : DTC.Submit_new_single_order.t) stop_exec_
       ?stopPx
       ?clOrdID:req.client_order_id
       ?text:req.free_form_text
-      ~symbol ~qty ~ordType ~timeInForce ()
+      ~symbol ~orderQty ~ordType ~timeInForce ()
   in
   REST.Order.submit_bulk
     ~log:log_bitmex
@@ -1298,8 +1298,8 @@ let cancel_linked_orders req addr w key secret linkID =
   let filter = `Assoc ["clOrdLinkID", `String linkID] in
   REST.Order.cancel_all
     ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
-  | Ok (_resp, body) ->
-    Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body
+  | Ok _resp ->
+    Log.debug log_bitmex "<- Cancel Order OK"
   | Error err ->
     let err_str = Error.to_string_hum err in
     reject_cancel_order req addr w "%s" err_str;
