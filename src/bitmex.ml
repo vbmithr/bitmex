@@ -415,8 +415,8 @@ let status_reason_of_execType_ordStatus e =
       "status_resaon_of_execType_ordStatus: execType=%s, ordStatus=%s"
       execType ordStatus ()
   in
-  let execType = RespObj.(string_exn e "execType") in
   let ordStatus = RespObj.(string_exn e "ordStatus") in
+  let execType = Option.value ~default:ordStatus RespObj.(string e "execType") in
   if execType = ordStatus then
     match execType with
     | "New" -> `order_status_open, `new_order_accepted
@@ -465,75 +465,74 @@ let write_order_update ~nb_msgs ~msg_number w e =
     let u = DTC.default_order_update () in
     let price = float_or_null_exn ~default:Float.max_finite_value e "price" in
     let stopPx = float_or_null_exn ~default:Float.max_finite_value e "stopPx" in
-    let side = string_exn e "side" |> Side.of_string in
-    let ordType =
-      (OrderType.of_string (string_exn e "ordType")) in
-    let timeInForce =
-      (TimeInForce.of_string (string_exn e "timeInForce")) in
-    let ts =
-      string e "transactTime" |>
-      Option.map ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) in
-    let p1, p2 = OrderType.to_p1_p2 ~stopPx ~price ordType in
+    let side = Option.map (string e "side") ~f:Side.of_string in
+    let ordType = Option.map (string e "ordType") ~f:OrderType.of_string in
+    let timeInForce = Option.map (string e "timeInForce")~f:TimeInForce.of_string in
+    let ts = Option.map (string e "transactTime")
+       ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) in
+    let p1, p2 = OrderType.to_p1_p2 ~stopPx ~price
+        (Option.value ~default:`order_type_unset ordType) in
     u.total_num_messages <- Some (Int32.of_int_exn nb_msgs) ;
     u.message_number <- Some (Int32.of_int_exn msg_number) ;
-    u.symbol <- Some (string_exn e "symbol") ;
+    u.symbol <- (string e "symbol") ;
     u.exchange <- Some !my_exchange ;
-    u.client_order_id <- Some (string_exn e "clOrdID") ;
-    u.server_order_id <- Some (string_exn e "orderID") ;
-    u.exchange_order_id <- Some (string_exn e "orderID") ;
-    u.order_type <- Some ordType ;
+    u.client_order_id <- string e "clOrdID" ;
+    u.server_order_id <- string e "orderID" ;
+    u.exchange_order_id <- string e "orderID" ;
+    u.order_type <- ordType ;
     u.order_status <- Some status ;
     u.order_update_reason <- Some reason ;
-    u.buy_sell <- Some side ;
+    u.buy_sell <- side ;
     u.price1 <- p1 ;
     u.price2 <- p2 ;
-    u.time_in_force <- Some timeInForce ;
-    u.order_quantity <- Some (int64_exn e "orderQty" |> Int64.to_float) ;
-    u.filled_quantity <- Some (int64_exn e "cumQty" |> Int64.to_float) ;
-    u.remaining_quantity <- Some (int64_exn e "leavesQty" |> Int64.to_float) ;
+    u.time_in_force <- timeInForce ;
+    u.order_quantity <- Option.map (int64 e "orderQty") ~f:Int64.to_float ;
+    u.filled_quantity <- Option.map (int64 e "cumQty") ~f:Int64.to_float ;
+    u.remaining_quantity <- Option.map (int64 e "leavesQty") ~f:Int64.to_float ;
     u.average_fill_price <- (float e "avgPx") ;
     u.last_fill_price <- (float e "lastPx") ;
     u.last_fill_date_time <- ts ;
-    u.last_fill_quantity <- (int64 e "lastQty" |> Option.map ~f:Int64.to_float) ;
-    u.last_fill_execution_id <- Some (string_exn e "execID") ;
-    u.trade_account <- Some (int64_exn e "account" |> Int64.to_string) ;
-    u.free_form_text <- Some (string_exn e "text") ;
+    u.last_fill_quantity <- Option.map ~f:Int64.to_float (int64 e "lastQty") ;
+    u.last_fill_execution_id <- string e "execID" ;
+    u.trade_account <- Option.map ~f:Int64.to_string (int64 e "account") ;
+    u.free_form_text <- string e "text" ;
     write_message w `order_update DTC.gen_order_update u ;
     true
 
 let write_position_update ?request_id ~nb_msgs ~msg_number w p =
-  let symbol = RespObj.string_exn p "symbol" in
-  let trade_account = RespObj.int_exn p "account" in
-  let avgEntryPrice = RespObj.float_exn p "avgEntryPrice" in
-  let currentQty = RespObj.int_exn p "currentQty" in
+  let symbol = RespObj.string p "symbol" in
+  let trade_account = RespObj.int p "account" in
+  let avgEntryPrice = RespObj.float p "avgEntryPrice" in
+  let currentQty = RespObj.int p "currentQty" in
   let u = DTC.default_position_update () in
   u.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
   u.message_number <- Some (Int32.of_int_exn msg_number) ;
   u.request_id <- request_id ;
-  u.symbol <- Some symbol ;
+  u.symbol <- symbol ;
   u.exchange <- Some !my_exchange ;
-  u.trade_account <- Some (Int.to_string trade_account) ;
-  u.average_price <- Some avgEntryPrice ;
-  u.quantity <- Some (Int.to_float currentQty) ;
+  u.trade_account <- Option.map trade_account ~f:Int.to_string ;
+  u.average_price <- avgEntryPrice ;
+  u.quantity <- Option.map currentQty ~f:Int.to_float ;
   write_message w `position_update DTC.gen_position_update u
 
 let write_balance_update ?request_id ~msg_number ~nb_msgs w m =
+  let open RespObj in
   let u = DTC.default_account_balance_update () in
   u.request_id <- request_id ;
   u.unsolicited <- Some (Option.is_none request_id) ;
   u.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
   u.message_number <- Some (Int32.of_int_exn msg_number) ;
   u.account_currency <- Some "mXBT" ;
-  u.cash_balance <- Some RespObj.(Int64.(to_float @@ int64_exn m "walletBalance") /. 1e5) ;
+  u.cash_balance <- Some (Int64.(to_float @@ int64_exn m "walletBalance") /. 1e5) ;
   u.balance_available_for_new_positions <-
-    Some RespObj.(Int64.(to_float @@ int64_exn m "availableMargin") /. 1e5) ;
+    Some (Int64.(to_float @@ int64_exn m "availableMargin") /. 1e5) ;
   u.securities_value <-
-    Some RespObj.(Int64.(to_float @@ int64_exn m "marginBalance") /. 1e5) ;
-  u.margin_requirement <- RespObj.(Int64.(
+    Some (Int64.(to_float @@ int64_exn m "marginBalance") /. 1e5) ;
+  u.margin_requirement <- (Int64.(
       Some (to_float (int64_exn m "initMargin" +
                       int64_exn m "maintMargin" +
                       int64_exn m "sessionMargin") /. 1e5))) ;
-  u.trade_account <- Some RespObj.(int64_exn m "account" |> Int64.to_string) ;
+  u.trade_account <- Option.map (int64 m "account") ~f:Int64.to_string ;
   write_message w `account_balance_update DTC.gen_account_balance_update u
 
 type subscribe_msg =
@@ -1084,16 +1083,18 @@ let write_account_balance_update ?request_id ~msg_number ~nb_msgs addr w account
 let account_balance_request addr w msg =
   let req = DTC.parse_account_balance_request msg in
   let { Connection.margin } = Connection.find_exn addr in
-  Log.debug log_dtc "<- [%s] Account Balance Request" addr ;
   let nb_msgs = IS.Table.length margin in
   if nb_msgs = 0 then write_no_balances ?request_id:req.request_id addr w
   else match req.trade_account with
-    | None ->
+    | None
+    | Some "" ->
+      Log.debug log_dtc "<- [%s] Account Balance Request" addr ;
       IS.Table.fold margin ~init:1~f:begin fun ~key:(account_id, currency) ~data msg_number ->
         write_account_balance_update ~msg_number ~nb_msgs addr w account_id data ;
         succ msg_number
       end |> ignore
     | Some trade_account ->
+      Log.debug log_dtc "<- [%s] Account Balance Request (%s)" addr trade_account ;
       match IS.Table.find margin (Int.of_string trade_account, "XBt") with
       | Some obj ->
         write_account_balance_update
@@ -1159,9 +1160,13 @@ let submit_order w ~key ~secret (req : DTC.Submit_new_single_order.t) stop_exec_
   let timeInForce = Option.value ~default:`tif_unset req.time_in_force in
   let price, stopPx =
     OrderType.to_price_stopPx ?p1:req.price1 ?p2:req.price2 ordType in
+  let stop_exec_inst = match ordType with
+    | `order_type_market
+    | `order_type_limit -> []
+    | #OrderType.t -> [stop_exec_inst] in
   let displayQty, execInst = match timeInForce with
-    | `tif_all_or_none -> Some 0, [ExecInst.AllOrNone ; stop_exec_inst]
-    | #DTC.time_in_force_enum -> None, [stop_exec_inst] in
+    | `tif_all_or_none -> Some 0, ExecInst.AllOrNone :: stop_exec_inst
+    | #DTC.time_in_force_enum -> None, stop_exec_inst in
   let order =
     REST.Order.create
       ?displayQty
@@ -1229,7 +1234,6 @@ let amend_order addr w req key secret orderID ordType =
   let price2 = if req.price2_is_set = Some true then req.price2 else None in
   let price, stopPx = OrderType.to_price_stopPx ?p1:price1 ?p2:price2 ordType in
   let amend = REST.Order.create_amend
-    ?clOrdID:req.client_order_id
     ?leavesQty:(Option.map req.quantity ~f:Float.to_int)
     ?price
     ?stopPx
@@ -1245,11 +1249,13 @@ let amend_order addr w req key secret orderID ordType =
 let cancel_replace_order addr w msg =
   let req = DTC.parse_cancel_replace_order msg in
   let { Connection.key; secret; order } = Connection.find_exn addr in
-  Log.debug log_dtc "<- [%s] Cancel Order" addr ;
-  if Option.is_some req.order_type then
+  Log.debug log_dtc "<- [%s] Cancel Replace Order" addr ;
+  let order_type = Option.value ~default:`order_type_unset req.order_type in
+  let time_in_force = Option.value ~default:`tif_unset req.time_in_force in
+  if order_type <> `order_type_unset then
     reject_cancel_replace_order req addr w
       "Modification of order type is not supported by BitMEX"
-  else if Option.is_some req.time_in_force then
+  else if time_in_force <> `tif_unset then
     reject_cancel_replace_order req addr w
       "Modification of time in force is not supported by BitMEX"
   else match req.server_order_id with
