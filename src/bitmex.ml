@@ -702,11 +702,12 @@ let accept_logon_request addr w req client stop_exec_inst trading =
 
   Log.debug log_dtc "-> [%s] Logon Response" addr ;
   let on_instrument { Instrument.secdef } =
+    secdef.request_id <- Some 0l ;
     secdef.is_final_message <- Some true ;
     write_message w `security_definition_response
       DTC.gen_security_definition_response secdef
   in
-  ignore @@ String.Table.iter Instrument.active ~f:on_instrument
+  Instrument.iter ~f:on_instrument
 
 let setup_client_ws conn apikey =
   let ws_initialized = client_ws conn in
