@@ -53,20 +53,6 @@ let write_message w (typ : DTC.dtcmessage_type) gen msg =
   Writer.write w header ;
   Writer.write w msg
 
-let seconds_of_ts_string ts =
-  Time_ns.(to_int_ns_since_epoch (of_string ts) / 1_000_000_000) |>
-  Int64.of_int
-
-let seconds_int32_of_ts ts =
-  Time_ns.(to_int_ns_since_epoch ts / 1_000_000_000) |>
-  Int32.of_int
-
-let float_of_ts ts =
-  Time_ns.to_int_ns_since_epoch ts // 1_000_000_000
-
-let float_of_ts_string ts =
-  Time_ns.(to_int_ns_since_epoch (of_string ts) // 1_000_000_000)
-
 module IS = struct
   module T = struct
     type t = Int.t * String.t [@@deriving sexp]
@@ -423,50 +409,53 @@ let send_heartbeat { Connection.addr; w; dropped } ival =
   | Error _ -> Log.error log_dtc "-/-> %s HB" addr
   | Ok _ -> ()
 
+let status_reason_of_execType_ordStatus e =
+  let invalid_arg execType ordStatus =
+    invalid_argf
+      "status_resaon_of_execType_ordStatus: execType=%s, ordStatus=%s"
+      execType ordStatus ()
+  in
+  let execType = RespObj.(string_exn e "execType") in
+  let ordStatus = RespObj.(string_exn e "ordStatus") in
+  if execType = ordStatus then
+    match execType with
+    | "New" -> `order_status_open, `new_order_accepted
+    | "PartiallyFilled" -> `order_status_partially_filled, `order_filled_partially
+    | "Filled" -> `order_status_filled, `order_filled
+    | "DoneForDay" -> `order_status_open, `general_order_update
+    | "Canceled" -> `order_status_canceled, `order_canceled
+    | "PendingCancel" -> `order_status_pending_cancel, `general_order_update
+    | "Stopped" -> `order_status_open, `general_order_update
+    | "Rejected" -> `order_status_rejected, `new_order_rejected
+    | "PendingNew" -> `order_status_pending_open, `general_order_update
+    | "Expired" -> `order_status_rejected, `new_order_rejected
+    | _ -> invalid_arg execType ordStatus
+  else
+    match execType, ordStatus with
+    | "Restated", _ ->
+      (match ordStatus with
+       | "New" -> `order_status_open, `general_order_update
+       | "PartiallyFilled" -> `order_status_partially_filled, `general_order_update
+       | "Filled" -> `order_status_filled, `general_order_update
+       | "DoneForDay" -> `order_status_open, `general_order_update
+       | "Canceled" -> `order_status_canceled, `general_order_update
+       | "PendingCancel" -> `order_status_pending_cancel, `general_order_update
+       | "Stopped" -> `order_status_open, `general_order_update
+       | "Rejected" -> `order_status_rejected, `general_order_update
+       | "PendingNew" -> `order_status_pending_open, `general_order_update
+       | "Expired" -> `order_status_rejected, `general_order_update
+       | _ -> invalid_arg execType ordStatus
+      )
+    | "Trade", "Filled" -> `order_status_filled, `order_filled
+    | "Trade", "PartiallyFilled" -> `order_status_partially_filled, `order_filled_partially
+    | "Replaced", "New" -> `order_status_open, `order_cancel_replace_complete
+    | "TriggeredOrActivatedBySystem", "New" -> `order_status_open, `new_order_accepted
+    | "Funding", _ -> raise Exit
+    | "Settlement", _ -> raise Exit
+    | _ -> invalid_arg execType ordStatus
+
 let write_order_update ~nb_msgs ~msg_number w e =
-  let invalid_arg' execType ordStatus =
-    invalid_arg Printf.(sprintf "write_order_update: execType=%s, ordStatus=%s" execType ordStatus)
-  in
-  let status_reason_of_execType_ordStatus e =
-    let execType = RespObj.(string_exn e "execType") in
-    let ordStatus = RespObj.(string_exn e "ordStatus") in
-    if execType = ordStatus then
-      match execType with
-      | "New" -> `order_status_open, `new_order_accepted
-      | "PartiallyFilled" -> `order_status_partially_filled, `order_filled_partially
-      | "Filled" -> `order_status_filled, `order_filled
-      | "DoneForDay" -> `order_status_open, `general_order_update
-      | "Canceled" -> `order_status_canceled, `order_canceled
-      | "PendingCancel" -> `order_status_pending_cancel, `general_order_update
-      | "Stopped" -> `order_status_open, `general_order_update
-      | "Rejected" -> `order_status_rejected, `new_order_rejected
-      | "PendingNew" -> `order_status_pending_open, `general_order_update
-      | "Expired" -> `order_status_rejected, `new_order_rejected
-      | _ -> invalid_arg' execType ordStatus
-    else
-      match execType, ordStatus with
-      | "Restated", _ ->
-        (match ordStatus with
-         | "New" -> `order_status_open, `general_order_update
-         | "PartiallyFilled" -> `order_status_partially_filled, `general_order_update
-         | "Filled" -> `order_status_filled, `general_order_update
-         | "DoneForDay" -> `order_status_open, `general_order_update
-         | "Canceled" -> `order_status_canceled, `general_order_update
-         | "PendingCancel" -> `order_status_pending_cancel, `general_order_update
-         | "Stopped" -> `order_status_open, `general_order_update
-         | "Rejected" -> `order_status_rejected, `general_order_update
-         | "PendingNew" -> `order_status_pending_open, `general_order_update
-         | "Expired" -> `order_status_rejected, `general_order_update
-         | _ -> invalid_arg' execType ordStatus
-        )
-      | "Trade", "Filled" -> `order_status_filled, `order_filled
-      | "Trade", "PartiallyFilled" -> `order_status_partially_filled, `order_filled_partially
-      | "Replaced", "New" -> `order_status_open, `order_cancel_replace_complete
-      | "TriggeredOrActivatedBySystem", "New" -> `order_status_open, `new_order_accepted
-      | "Funding", _ -> raise Exit
-      | "Settlement", _ -> raise Exit
-      | _ -> invalid_arg' execType ordStatus
-  in
+  let open RespObj in
   match status_reason_of_execType_ordStatus e with
   | exception Exit -> false
   | exception Invalid_argument msg ->
@@ -474,23 +463,24 @@ let write_order_update ~nb_msgs ~msg_number w e =
     false
   | status, reason ->
     let u = DTC.default_order_update () in
-    let price = RespObj.(float_or_null_exn ~default:Float.max_finite_value e "price") in
-    let stopPx = RespObj.(float_or_null_exn ~default:Float.max_finite_value e "stopPx") in
-    let side = RespObj.string_exn e "side" |> Side.of_string in
+    let price = float_or_null_exn ~default:Float.max_finite_value e "price" in
+    let stopPx = float_or_null_exn ~default:Float.max_finite_value e "stopPx" in
+    let side = string_exn e "side" |> Side.of_string in
     let ordType =
-      (OrderType.of_string RespObj.(string_exn e "ordType")) in
+      (OrderType.of_string (string_exn e "ordType")) in
     let timeInForce =
-      (TimeInForce.of_string RespObj.(string_exn e "timeInForce")) in
+      (TimeInForce.of_string (string_exn e "timeInForce")) in
     let ts =
-      RespObj.(string e "transactTime" |> Option.map ~f:seconds_of_ts_string) in
+      string e "transactTime" |>
+      Option.map ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) in
     let p1, p2 = OrderType.to_p1_p2 ~stopPx ~price ordType in
     u.total_num_messages <- Some (Int32.of_int_exn nb_msgs) ;
     u.message_number <- Some (Int32.of_int_exn msg_number) ;
-    u.symbol <- Some RespObj.(string_exn e "symbol") ;
+    u.symbol <- Some (string_exn e "symbol") ;
     u.exchange <- Some !my_exchange ;
-    u.client_order_id <- Some RespObj.(string_exn e "clOrdID") ;
-    u.server_order_id <- Some RespObj.(string_exn e "orderID") ;
-    u.exchange_order_id <- Some RespObj.(string_exn e "orderID") ;
+    u.client_order_id <- Some (string_exn e "clOrdID") ;
+    u.server_order_id <- Some (string_exn e "orderID") ;
+    u.exchange_order_id <- Some (string_exn e "orderID") ;
     u.order_type <- Some ordType ;
     u.order_status <- Some status ;
     u.order_update_reason <- Some reason ;
@@ -498,16 +488,16 @@ let write_order_update ~nb_msgs ~msg_number w e =
     u.price1 <- p1 ;
     u.price2 <- p2 ;
     u.time_in_force <- Some timeInForce ;
-    u.order_quantity <- Some RespObj.(int64_exn e "orderQty" |> Int64.to_float) ;
-    u.filled_quantity <- Some RespObj.(int64_exn e "cumQty" |> Int64.to_float) ;
-    u.remaining_quantity <- Some RespObj.(int64_exn e "leavesQty" |> Int64.to_float) ;
-    u.average_fill_price <- RespObj.(float e "avgPx") ;
-    u.last_fill_price <- RespObj.(float e "lastPx") ;
+    u.order_quantity <- Some (int64_exn e "orderQty" |> Int64.to_float) ;
+    u.filled_quantity <- Some (int64_exn e "cumQty" |> Int64.to_float) ;
+    u.remaining_quantity <- Some (int64_exn e "leavesQty" |> Int64.to_float) ;
+    u.average_fill_price <- (float e "avgPx") ;
+    u.last_fill_price <- (float e "lastPx") ;
     u.last_fill_date_time <- ts ;
-    u.last_fill_quantity <- RespObj.(int64 e "lastQty" |> Option.map ~f:Int64.to_float) ;
-    u.last_fill_execution_id <- Some RespObj.(string_exn e "execID") ;
-    u.trade_account <- Some RespObj.(int64_exn e "account" |> Int64.to_string) ;
-    u.free_form_text <- Some RespObj.(string_exn e "text") ;
+    u.last_fill_quantity <- (int64 e "lastQty" |> Option.map ~f:Int64.to_float) ;
+    u.last_fill_execution_id <- Some (string_exn e "execID") ;
+    u.trade_account <- Some (int64_exn e "account" |> Int64.to_string) ;
+    u.free_form_text <- Some (string_exn e "text") ;
     write_message w `order_update DTC.gen_order_update u ;
     true
 
@@ -792,19 +782,20 @@ let reject_market_data_request ?id addr w k =
 let write_market_data_snapshot ?id addr w symbol
     { Instrument.instrObj; last_trade_price;
       last_trade_size; last_trade_ts; last_quote_ts } =
+  let open RespObj in
   if Instrument.is_index symbol then begin
     let snap = DTC.default_market_data_snapshot () in
     snap.symbol_id <- id ;
-    snap.session_settlement_price <- RespObj.float instrObj "prevPrice24h" ;
-    snap.last_trade_price <- RespObj.float instrObj "lastPrice" ;
+    snap.session_settlement_price <- float instrObj "prevPrice24h" ;
+    snap.last_trade_price <- float instrObj "lastPrice" ;
     snap.last_trade_date_time <-
-      RespObj.string instrObj "timestamp" |> Option.map ~f:float_of_ts_string ;
+      string instrObj "timestamp" |>
+      Option.map ~f:(Fn.compose float_of_ts Time_ns.of_string) ;
     write_message w `market_data_snapshot DTC.gen_market_data_snapshot snap
   end
   else begin
     let { Quote.bidPrice; bidSize; askPrice; askSize } = Quotes.find_exn symbol in
     let open Option in
-    let open RespObj in
     let snap = DTC.default_market_data_snapshot () in
     snap.session_settlement_price <-
       Some (value ~default:Float.max_finite_value (float instrObj "indicativeSettlePrice")) ;
@@ -1008,23 +999,25 @@ let current_positions_request addr w msg =
 
 let send_historical_order_fills_response ?request_id addr w = function
   | `List orders ->
+    let open RespObj in
     let resp = DTC.default_historical_order_fill_response () in
     let nb_msgs = List.length orders in
     resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
     resp.request_id <- request_id ;
     List.iteri orders ~f:begin fun i o ->
-      let o = RespObj.of_json o in
-      let side = RespObj.string_exn o "side" |> Side.of_string in
+      let o = of_json o in
+      let side = string_exn o "side" |> Side.of_string in
       resp.message_number <- Some Int32.(succ @@ of_int_exn i) ;
-      resp.symbol <- Some RespObj.(string_exn o "symbol") ;
+      resp.symbol <- Some (string_exn o "symbol") ;
       resp.exchange <- Some !my_exchange ;
-      resp.server_order_id <- Some RespObj.(string_exn o "orderID") ;
-      resp.price <- Some RespObj.(float_exn o "avgPx") ;
-      resp.quantity <- Some Float.(of_int64 RespObj.(int64_exn o "orderQty")) ;
+      resp.server_order_id <- Some (string_exn o "orderID") ;
+      resp.price <- Some (float_exn o "avgPx") ;
+      resp.quantity <- Some Float.(of_int64 (int64_exn o "orderQty")) ;
       resp.date_time <-
-        (RespObj.string o "transactTime" |> Option.map ~f:seconds_of_ts_string) ;
+        string o "transactTime" |>
+        Option.map ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) ;
       resp.buy_sell <- Some side ;
-      resp.unique_execution_id <- Some RespObj.(string_exn o "execID") ;
+      resp.unique_execution_id <- Some (string_exn o "execID") ;
       write_message w `historical_order_fill_response
         DTC.gen_historical_order_fill_response resp
     end ;
