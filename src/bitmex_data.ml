@@ -66,6 +66,82 @@ let mk_store_trade_in_db () =
 
 let store_trade_in_db = mk_store_trade_in_db ()
 
+let write_message w (typ : DTC.dtcmessage_type) gen msg =
+  let typ =
+    Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
+  let msg = (gen msg |> Piqirun.to_string) in
+  let header = Bytes.create 4 in
+  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
+  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
+  Writer.write w header ;
+  Writer.write w msg
+
+module Granulator = struct
+  type t = {
+    nb_streamed : int ;
+    nb_processed : int ;
+    start_ts : Time_ns.t ;
+    end_ts : Time_ns.t ;
+    record : DTC.Historical_price_data_record_response.t ;
+  }
+
+  let create
+      ?(nb_streamed=0) ?(nb_processed=0) ?request_id
+      ~ts ~price ~qty ~side ~span () =
+    let record = DTC.default_historical_price_data_record_response () in
+    record.request_id <- request_id ;
+    record.start_date_time <- Some (seconds_int64_of_ts ts) ;
+    record.open_price <- Some price ;
+    record.high_price <- Some price ;
+    record.low_price <- Some price ;
+    record.last_price <- Some price ;
+    record.volume <- Some qty ;
+    record.num_trades <- Some 1l ;
+    record.bid_volume <- if side = `buy then Some qty else None ;
+    record.ask_volume <- if side = `sell then Some qty else None ;
+    {
+      nb_streamed ;
+      nb_processed ;
+      start_ts = ts ;
+      end_ts = Time_ns.(add ts @@ Span.(span - nanosecond)) ;
+      record ;
+    }
+
+  let add_tick ?request_id ~w ~span ~ts ~price ~qty ~side = function
+    | None ->
+      create ?request_id ~span ~ts ~price ~qty ~side ()
+    | Some r ->
+      if Time_ns.between ts ~low:r.start_ts ~high:r.end_ts then begin
+        r.record.high_price <-
+          Option.map r.record.high_price ~f:(Float.max price) ;
+        r.record.low_price <-
+          Option.map r.record.low_price ~f:(Float.min price) ;
+        r.record.last_price <- Some price ;
+        r.record.volume <-
+          Option.map r.record.volume ~f:Float.(( + ) qty) ;
+        r.record.num_trades <-
+          Option.map r.record.num_trades ~f:Int32.succ ;
+        r.record.bid_volume <-
+          Option.map r.record.bid_volume ~f:begin fun b ->
+            if side = `buy then b +. qty else b
+          end ;
+        r.record.ask_volume <-
+          Option.map r.record.ask_volume ~f:begin fun a ->
+            if side = `sell then a +. qty else a
+          end ;
+        { r with nb_processed = succ r.nb_processed }
+      end
+      else begin
+        write_message w `historical_price_data_record_response
+          DTC.gen_historical_price_data_record_response r.record ;
+        create
+          ?request_id
+          ~nb_streamed:(succ r.nb_streamed)
+          ~nb_processed:r.nb_processed
+          ~span ~ts ~price ~qty ~side ()
+      end
+end
+
 module RateLimit = struct
   type t = {
     limit : int ;
@@ -114,16 +190,6 @@ let rec pump startTime =
     pump Time_ns.(add last_ts @@ Span.of_int_ns 1)
 
 (* A DTC Historical Price Server. *)
-
-let write_message w (typ : DTC.dtcmessage_type) gen msg =
-  let typ =
-    Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
-  let msg = (gen msg |> Piqirun.to_string) in
-  let header = Bytes.create 4 in
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
-  Writer.write w header ;
-  Writer.write w msg
 
 let encoding_request addr w req =
   debug "<- [%s] Encoding Request" addr ;
@@ -177,80 +243,81 @@ let span_of_interval = function
 let max_int_value = Int64.of_int_exn Int.max_value
 let start_key = Bytes.create 8
 
+let stream_tick_responses symbol
+    ?stop db w (req : DTC.Historical_price_data_request.t) start =
+  info "Streaming %s from %s (tick)" symbol Time_ns.(to_string start) ;
+  let resp = DTC.default_historical_price_data_tick_record_response () in
+  resp.request_id <- req.request_id ;
+  resp.is_final_record <- Some false ;
+  let nb_streamed =
+    DB.HL.fold_left db ?stop ~start ~init:0 ~f:begin fun a t ->
+      let p = Int63.to_float t.Tick.p /. 1e8 in
+      let v = Int63.to_float t.v in
+      let side = match t.side with
+        | `buy -> `at_bid
+        | `sell -> `at_ask
+        | `buy_sell_unset -> `bid_ask_unset in
+      resp.date_time <- Some (float_of_ts t.ts) ;
+      resp.price <- Some p ;
+      resp.volume <- Some v ;
+      resp.at_bid_or_ask <- Some side ;
+      write_message w `historical_price_data_tick_record_response
+        DTC.gen_historical_price_data_tick_record_response resp ;
+      succ a ;
+    end in
+  let resp = DTC.default_historical_price_data_tick_record_response () in
+  resp.request_id <- req.request_id ;
+  resp.is_final_record <- Some true ;
+  write_message w `historical_price_data_tick_record_response
+    DTC.gen_historical_price_data_tick_record_response resp ;
+  nb_streamed, nb_streamed
+
+let stream_record_responses symbol
+    ?stop db w (req : DTC.Historical_price_data_request.t) start span =
+  info "Streaming %s from %s (%s)" symbol
+    Time_ns.(to_string start) (Time_ns.Span.to_string span) ;
+  let add_tick = Granulator.add_tick ~w ?request_id:req.request_id ~span in
+  let r =
+    DB.HL.fold_left db ~start ?stop ~init:None ~f:begin fun a t ->
+      let price = Int63.to_float t.p /. 1e8 in
+      let qty = Int63.to_float t.v in
+      Some (add_tick ~ts:t.ts ~price ~qty ~side:t.side a)
+    end in
+  Option.iter r ~f:begin fun r ->
+    write_message w `historical_price_data_record_response
+      DTC.gen_historical_price_data_record_response r.record ;
+  end ;
+  let resp = DTC.default_historical_price_data_record_response () in
+  resp.request_id <- req.request_id ;
+  resp.is_final_record <- Some true ;
+  write_message w `historical_price_data_record_response
+    DTC.gen_historical_price_data_record_response resp ;
+  Option.value_map r ~default:0 ~f:(fun r -> r.nb_streamed),
+  Option.value_map r ~default:0 ~f:(fun r -> r.nb_processed)
+
 let accept_historical_price_data_request
-    w (req : DTC.Historical_price_data_request.t) db symbol =
-  (* SC sometimes uses negative timestamps. Correcting this. *)
+    w (req : DTC.Historical_price_data_request.t) db symbol span =
   let hdr = DTC.default_historical_price_data_response_header () in
   hdr.request_id <- req.request_id ;
   hdr.record_interval <- req.record_interval ;
   hdr.use_zlib_compression <- Some false ;
   hdr.int_to_float_price_divisor <- Some 1e8 ;
   write_message w `historical_price_data_response_header
-      DTC.gen_historical_price_data_response_header hdr ;
-
-  (* Now sending tick responses. *)
-  let start_date_time =
-    Int64.(max 0L (Option.value_map req.start_date_time ~default:0L ~f:(( * ) 1_000_000_000L))) in
-  let end_date_time = Option.value_map req.end_date_time
-      ~default:max_int_value ~f:begin function
-      | 0L -> max_int_value
-      | v -> Int64.(v * 1_000_000_000L)
-    end in
-  Binary_packing.pack_signed_64_big_endian start_key 0 start_date_time ;
-  info "Starting streaming %s from %Ld to %Ld"
-    symbol
-    (* Time_ns.(of_int_ns_since_epoch (Int64.to_int_exn start_date_time) |> to_string) *)
-    (* Time_ns.(of_int_ns_since_epoch (Int64.to_int_exn end_date_time) |> to_string) ; *)
-    start_date_time end_date_time ;
-  let nb_streamed = ref 0 in
-  (* if m.record_interval = 0 then begin (\* streaming tick responses *\) *)
-  let resp = DTC.default_historical_price_data_tick_record_response () in
-  resp.request_id <- req.request_id ;
-  resp.is_final_record <- Some false ;
-  DB.iter_from begin fun ts data ->
-    let ts = Binary_packing.unpack_signed_64_big_endian ts 0 in
-    if Int64.(ts > end_date_time) then false
-    else begin
-      let t = Tick.Bytes.read' ~ts:Time_ns.epoch ~data () in
-      let p = Int63.to_float t.p /. 1e8 in
-      let v = Int63.to_float t.v in
-      let side = match t.side with
-        | `buy -> `at_bid
-        | `sell -> `at_ask
-        | `buy_sell_unset -> `bid_ask_unset in
-      resp.date_time <- Some Float.(of_int64 ts / 1e8) ;
-      resp.price <- Some p ;
-      resp.volume <- Some v ;
-      resp.at_bid_or_ask <- Some side ;
-      write_message w `historical_price_data_tick_record_response
-        DTC.gen_historical_price_data_tick_record_response resp ;
-      incr nb_streamed ;
-      true
-    end
-  end db start_key;
-  let resp = DTC.default_historical_price_data_tick_record_response () in
-  resp.request_id <- req.request_id ;
-  resp.is_final_record <- Some true ;
-  write_message w `historical_price_data_tick_record_response
-      DTC.gen_historical_price_data_tick_record_response resp ;
-  !nb_streamed, !nb_streamed
-  (* end *)
-  (* else begin (\* streaming record responses *\) *)
-  (*   let g = new Granulator.granulator ~request_id:m.request_id ~record_interval ~writer:w in *)
-  (*   DB.iter_from begin fun ts data -> *)
-  (*     let ts = Binary_packing.unpack_signed_64_big_endian ts 0 |> Int63.of_int64_exn |> Time_ns.of_int63_ns_since_epoch in *)
-  (*     if Time_ns.(m.end_ts > epoch && ts > m.end_ts) then false *)
-  (*     else begin *)
-  (*       let t = Dtc.Tick.Bytes.read' ~ts ~data () in *)
-  (*       let side = Option.value_exn ~message:"side is undefined" t.side in *)
-  (*       let p = Int63.to_float t.p /. 1e8 in *)
-  (*       let v = Int63.to_float t.v in *)
-  (*       g#add_tick ts p v side; *)
-  (*       true *)
-  (*     end *)
-  (*   end db start_key; *)
-  (*   g#final *)
-  (* end *)
+    DTC.gen_historical_price_data_response_header hdr ;
+  let start =
+    Option.value_map req.start_date_time ~default:0L ~f:Int64.(( * ) 1_000_000_000L) |>
+    Int64.to_int_exn |>
+    Time_ns.of_int_ns_since_epoch |>
+    Time_ns.(max epoch) in
+  let stop =
+    Option.value_map req.end_date_time ~default:0L ~f:Int64.(( * ) 1_000_000_000L) |>
+    Int64.to_int_exn |>
+    Time_ns.of_int_ns_since_epoch in
+  let stop = if stop = Time_ns.epoch then None else Some stop in
+  if span = Time_ns.Span.zero then (* streaming tick responses *)
+    stream_tick_responses symbol ?stop db w req start
+  else
+    stream_record_responses symbol ?stop db w req start span
 
 let historical_price_data_request addr w msg =
   let req = DTC.parse_historical_price_data_request msg in
@@ -259,15 +326,9 @@ let historical_price_data_request addr w msg =
       debug "<- [%s] Historical Data Request %s %s" addr symbol exchange ;
     | _ -> ()
   end ;
-  let record_span =
+  let span =
     Option.value_map ~default:Time_ns.Span.zero
       ~f:span_of_interval req.record_interval in
-  if record_span <> Time_ns.Span.zero then begin
-    reject_historical_price_data_request
-      ~reason_code:`hpdr_general_reject_error
-      w req "Only Tick record interval is currently supported" ;
-    raise Exit
-  end ;
   match req.symbol, req.exchange, !use_testnet with
   | None, _, _ ->
     reject_historical_price_data_request
@@ -293,10 +354,9 @@ let historical_price_data_request addr w msg =
         ~reason_code:`hpdr_unable_to_serve_data_do_not_retry
         w req "No such symbol" ;
       raise Exit
-    | Some db ->
-      don't_wait_for begin
+    | Some db -> don't_wait_for begin
         In_thread.run begin fun () ->
-          accept_historical_price_data_request w req db symbol
+          accept_historical_price_data_request w req db symbol span
         end >>| fun (nb_streamed, nb_processed) ->
         info "Streamed %d/%d records from %s"
           nb_streamed nb_processed symbol
