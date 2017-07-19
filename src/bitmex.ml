@@ -55,9 +55,7 @@ let write_message w (typ : DTC.dtcmessage_type) gen msg =
 
 module IS = struct
   module T = struct
-    type t = Int.t * String.t [@@deriving sexp]
-    let compare = compare
-    let hash = Hashtbl.hash
+    type t = Int.t * String.t [@@deriving sexp,compare,hash]
   end
   include T
   include Hashable.Make (T)
@@ -80,7 +78,7 @@ module Connection = struct
     ws_w: WS.Response.Update.t Pipe.Writer.t;
     mutable ws_uuid: Uuid.t;
     key: string;
-    secret: Cstruct.t;
+    secret: string;
     position: RespObj.t IS.Table.t; (* indexed by account, symbol *)
     margin: RespObj.t IS.Table.t; (* indexed by account, currency *)
     order: RespObj.t Uuid.Table.t; (* indexed by orderID *)
@@ -97,8 +95,7 @@ module Connection = struct
   let create ~addr ~w ~key ~secret ~stop_exec_inst =
     let ws_r, ws_w = Pipe.create () in
     {
-      addr ; w ; ws_r ; ws_w ; key ;
-      secret = Cstruct.of_string secret ;
+      addr ; w ; ws_r ; ws_w ; key ; secret ;
       position = IS.Table.create () ;
       margin = IS.Table.create () ;
       order = Uuid.Table.create () ;
