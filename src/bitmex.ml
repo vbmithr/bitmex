@@ -82,7 +82,6 @@ module Connection = struct
     position: RespObj.t IS.Table.t; (* indexed by account, symbol *)
     margin: RespObj.t IS.Table.t; (* indexed by account, currency *)
     order: RespObj.t Uuid.Table.t; (* indexed by orderID *)
-    mutable dropped: int;
     subs: int32 String.Table.t;
     rev_subs: string Int32.Table.t;
     subs_depth: int32 String.Table.t;
@@ -108,7 +107,6 @@ module Connection = struct
 
       current_parent = None ;
       ws_uuid = Uuid.create () ;
-      dropped = 0 ;
     }
 
   let active : t String.Table.t = String.Table.create ()
@@ -392,64 +390,49 @@ module Quotes = struct
     Connection.iter ~f:on_connection
 end
 
-let send_heartbeat { Connection.addr; w; dropped } ival =
-  let ival = Option.value_map ival ~default:10 ~f:Int32.to_int_exn in
+let send_heartbeat { Connection.addr ; w } span =
   let msg = DTC.default_heartbeat () in
-  let rec loop () =
-    Clock_ns.after @@ Time_ns.Span.of_int_sec ival >>= fun () ->
-    Log.debug log_dtc "-> [%s] HB" addr;
-    msg.num_dropped_messages <- Some (Int32.of_int_exn dropped) ;
-    write_message w `heartbeat DTC.gen_heartbeat msg ;
-    loop ()
-  in
-  Monitor.try_with_or_error ~name:"heatbeat" loop >>| function
-  | Error _ -> Log.error log_dtc "-/-> %s HB" addr
-  | Ok _ -> ()
+  Clock_ns.every
+    ~stop:(Writer.close_started w)
+    ~continue_on_error:false span
+    begin fun () ->
+      (* Log.debug log_dtc "-> [%s] HB" addr ; *)
+      write_message w `heartbeat DTC.gen_heartbeat msg
+    end
+
+let fail_ordStatus_execType ~ordStatus ~execType =
+  invalid_argf
+    "Wrong ordStatus/execType pair: %s, %s"
+    (OrdStatus.show ordStatus)
+    (ExecType.show execType)
+    ()
 
 let status_reason_of_execType_ordStatus e =
-  let invalid_arg execType ordStatus =
-    invalid_argf
-      "status_resaon_of_execType_ordStatus: execType=%s, ordStatus=%s"
-      execType ordStatus ()
-  in
-  let ordStatus = RespObj.(string_exn e "ordStatus") in
-  let execType = Option.value ~default:ordStatus RespObj.(string e "execType") in
-  if execType = ordStatus then
-    match execType with
-    | "New" -> `order_status_open, `new_order_accepted
-    | "PartiallyFilled" -> `order_status_partially_filled, `order_filled_partially
-    | "Filled" -> `order_status_filled, `order_filled
-    | "DoneForDay" -> `order_status_open, `general_order_update
-    | "Canceled" -> `order_status_canceled, `order_canceled
-    | "PendingCancel" -> `order_status_pending_cancel, `general_order_update
-    | "Stopped" -> `order_status_open, `general_order_update
-    | "Rejected" -> `order_status_rejected, `new_order_rejected
-    | "PendingNew" -> `order_status_pending_open, `general_order_update
-    | "Expired" -> `order_status_rejected, `new_order_rejected
-    | _ -> invalid_arg execType ordStatus
-  else
-    match execType, ordStatus with
-    | "Restated", _ ->
-      (match ordStatus with
-       | "New" -> `order_status_open, `general_order_update
-       | "PartiallyFilled" -> `order_status_partially_filled, `general_order_update
-       | "Filled" -> `order_status_filled, `general_order_update
-       | "DoneForDay" -> `order_status_open, `general_order_update
-       | "Canceled" -> `order_status_canceled, `general_order_update
-       | "PendingCancel" -> `order_status_pending_cancel, `general_order_update
-       | "Stopped" -> `order_status_open, `general_order_update
-       | "Rejected" -> `order_status_rejected, `general_order_update
-       | "PendingNew" -> `order_status_pending_open, `general_order_update
-       | "Expired" -> `order_status_rejected, `general_order_update
-       | _ -> invalid_arg execType ordStatus
-      )
-    | "Trade", "Filled" -> `order_status_filled, `order_filled
-    | "Trade", "PartiallyFilled" -> `order_status_partially_filled, `order_filled_partially
-    | "Replaced", "New" -> `order_status_open, `order_cancel_replace_complete
-    | "TriggeredOrActivatedBySystem", "New" -> `order_status_open, `new_order_accepted
-    | "Funding", _ -> raise Exit
-    | "Settlement", _ -> raise Exit
-    | _ -> invalid_arg execType ordStatus
+  let ordStatus = RespObj.(string_exn e "ordStatus") |> OrdStatus.of_string in
+  let execType = RespObj.(string_exn e "execType") |> ExecType.of_string in
+  match ordStatus, execType with
+
+  | New, New
+  | New, TriggeredOrActivatedBySystem -> `order_status_open, `new_order_accepted
+  | New, Replaced -> `order_status_open, `order_cancel_replace_complete
+  | New, Restated -> `order_status_open, `general_order_update
+
+  | PartiallyFilled, Trade -> `order_status_partially_filled, `order_filled_partially
+  | PartiallyFilled, Restated -> `order_status_partially_filled, `general_order_update
+
+  | Filled, Trade -> `order_status_filled, `order_filled
+  | Filled, Restated -> `order_status_filled, `general_order_update
+
+  | Canceled, Canceled -> `order_status_canceled, `order_canceled
+  | Canceled, Restated -> `order_status_canceled, `general_order_update
+
+  | Rejected, New -> `order_status_rejected, `new_order_rejected
+  | Rejected, Restated -> `order_status_rejected, `general_order_update
+
+  | _, Funding -> raise Exit
+  | _, Settlement -> raise Exit
+
+  | _ -> fail_ordStatus_execType ~ordStatus ~execType
 
 let write_order_update ~nb_msgs ~msg_number w e =
   let open RespObj in
@@ -660,6 +643,10 @@ let encoding_request addr w req =
   Log.debug log_dtc "-> [%s] Encoding Response" addr
 
 let accept_logon_request addr w req client stop_exec_inst trading =
+  let hb_span =
+    Option.value_map req.DTC.Logon_request.heartbeat_interval_in_seconds
+      ~default:(Time_ns.Span.of_int_sec 10)
+      ~f:(fun span -> Time_ns.Span.of_int_sec (Int32.to_int_exn span)) in
   let trading_supported, result_text =
     match trading with
     | Ok msg -> true, Printf.sprintf "Trading enabled: %s" msg
@@ -681,9 +668,7 @@ let accept_logon_request addr w req client stop_exec_inst trading =
   r.ocoorders_supported <- Some false ;
   r.bracket_orders_supported <- Some false ;
 
-  don't_wait_for @@
-  send_heartbeat client req.DTC.Logon_request.heartbeat_interval_in_seconds;
-
+  send_heartbeat client hb_span ;
   write_message w `logon_response DTC.gen_logon_response r ;
 
   Log.debug log_dtc "-> [%s] Logon Response" addr ;
@@ -1567,7 +1552,7 @@ let dtcserver ~server ~port =
       if len < 2 then return @@ `Consumed (consumed, `Need_unknown)
       else
         let msglen = Bigstring.unsafe_get_int16_le buf ~pos in
-        Log.debug log_dtc "handle_chunk: pos=%d len=%d, msglen=%d" pos len msglen;
+        (* Log.debug log_dtc "handle_chunk: pos=%d len=%d, msglen=%d" pos len msglen; *)
         if len < msglen then return @@ `Consumed (consumed, `Need msglen)
         else begin
           let msgtype_int = Bigstring.unsafe_get_int16_le buf ~pos:(pos+2) in
