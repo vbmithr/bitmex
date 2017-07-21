@@ -418,20 +418,15 @@ let status_reason_of_execType_ordStatus e =
   | New, Restated -> `order_status_open, `general_order_update
 
   | PartiallyFilled, Trade -> `order_status_partially_filled, `order_filled_partially
+  | PartiallyFilled, Replaced -> `order_status_partially_filled, `order_cancel_replace_complete
   | PartiallyFilled, Restated -> `order_status_partially_filled, `general_order_update
 
   | Filled, Trade -> `order_status_filled, `order_filled
-  | Filled, Restated -> `order_status_filled, `general_order_update
-
   | Canceled, Canceled -> `order_status_canceled, `order_canceled
-  | Canceled, Restated -> `order_status_canceled, `general_order_update
-
-  | Rejected, New -> `order_status_rejected, `new_order_rejected
-  | Rejected, Restated -> `order_status_rejected, `general_order_update
+  | Rejected, Rejected -> `order_status_rejected, `new_order_rejected
 
   | _, Funding -> raise Exit
   | _, Settlement -> raise Exit
-
   | _ -> fail_ordStatus_execType ~ordStatus ~execType
 
 let write_order_update ~nb_msgs ~msg_number w e =
