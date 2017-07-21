@@ -11,38 +11,6 @@ module DTC = Dtc_pb.Dtcprotocol_piqi
 module WS = Bmex_ws
 module REST = Bmex_rest
 
-let rec loop_log_errors ?log f =
-  let rec inner () =
-    Monitor.try_with_or_error ~name:"loop_log_errors" f >>= function
-    | Ok _ -> assert false
-    | Error err ->
-      Option.iter log ~f:(fun log -> Log.error log "run: %s" @@ Error.to_string_hum err);
-      inner ()
-  in inner ()
-
-let conduit_server ~tls ~crt_path ~key_path =
-  if tls then
-    Sys.file_exists crt_path >>= fun crt_exists ->
-    Sys.file_exists key_path >>| fun key_exists ->
-    match crt_exists, key_exists with
-    | `Yes, `Yes -> `OpenSSL (`Crt_file_path crt_path, `Key_file_path key_path)
-    | _ -> failwith "TLS crt/key file not found"
-  else
-  return `TCP
-
-let price_display_format_of_ticksize tickSize =
-  if tickSize >=. 1. then `price_display_format_decimal_0
-  else if tickSize =. 1e-1 then `price_display_format_decimal_1
-  else if tickSize =. 1e-2 then `price_display_format_decimal_2
-  else if tickSize =. 1e-3 then `price_display_format_decimal_3
-  else if tickSize =. 1e-4 then `price_display_format_decimal_4
-  else if tickSize =. 1e-5 then `price_display_format_decimal_5
-  else if tickSize =. 1e-6 then `price_display_format_decimal_6
-  else if tickSize =. 1e-7 then `price_display_format_decimal_7
-  else if tickSize =. 1e-8 then `price_display_format_decimal_8
-  else if tickSize =. 1e-9 then `price_display_format_decimal_9
-  else invalid_argf "price_display_format_of_ticksize: %f" tickSize ()
-
 let write_message w (typ : DTC.dtcmessage_type) gen msg =
   let typ =
     Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
@@ -52,14 +20,6 @@ let write_message w (typ : DTC.dtcmessage_type) gen msg =
   Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
   Writer.write w header ;
   Writer.write w msg
-
-module IS = struct
-  module T = struct
-    type t = Int.t * String.t [@@deriving sexp,compare,hash]
-  end
-  include T
-  include Hashable.Make (T)
-end
 
 let use_testnet = ref false
 let base_uri = ref @@ Uri.of_string "https://www.bitmex.com"
