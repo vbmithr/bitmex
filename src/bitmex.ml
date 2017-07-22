@@ -935,34 +935,31 @@ let current_positions_request addr w msg =
   if nb_msgs = 0 then write_empty_position_update req w ;
   Log.debug log_dtc "-> [%s] %d positions" addr nb_msgs
 
-let send_historical_order_fills_response req addr w = function
-  | `List orders ->
-    let open RespObj in
-    let resp = DTC.default_historical_order_fill_response () in
-    let nb_msgs = List.length orders in
-    resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
-    resp.request_id <- req.DTC.Historical_order_fills_request.request_id ;
-    resp.trade_account <- req.trade_account ;
-    List.iteri orders ~f:begin fun i o ->
-      let o = of_json o in
-      let side = string_exn o "side" |> Side.of_string in
-      resp.message_number <- Some Int32.(succ @@ of_int_exn i) ;
-      resp.symbol <- Some (string_exn o "symbol") ;
-      resp.exchange <- Some !my_exchange ;
-      resp.server_order_id <- Some (string_exn o "orderID") ;
-      resp.price <- Some (float_exn o "avgPx") ;
-      resp.quantity <- Some Float.(of_int64 (int64_exn o "orderQty")) ;
-      resp.date_time <-
-        string o "transactTime" |>
-        Option.map ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) ;
-      resp.buy_sell <- Some side ;
-      resp.unique_execution_id <- Some (string_exn o "execID") ;
-      write_message w `historical_order_fill_response
-        DTC.gen_historical_order_fill_response resp
-    end ;
-    Log.debug log_dtc "-> [%s] Historical Order Fills Response %d" addr nb_msgs
-  | #Yojson.Safe.json ->
-    invalid_arg "bitmex historical order fills response"
+let send_historical_order_fills_response req addr w orders =
+  let open RespObj in
+  let resp = DTC.default_historical_order_fill_response () in
+  let nb_msgs = List.length orders in
+  resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
+  resp.request_id <- req.DTC.Historical_order_fills_request.request_id ;
+  resp.trade_account <- req.trade_account ;
+  List.iteri orders ~f:begin fun i o ->
+    let o = of_json o in
+    let side = string_exn o "side" |> Side.of_string in
+    resp.message_number <- Some Int32.(succ @@ of_int_exn i) ;
+    resp.symbol <- Some (string_exn o "symbol") ;
+    resp.exchange <- Some !my_exchange ;
+    resp.server_order_id <- Some (string_exn o "orderID") ;
+    resp.price <- Some (float_exn o "avgPx") ;
+    resp.quantity <- Some Float.(of_int64 (int64_exn o "orderQty")) ;
+    resp.date_time <-
+      string o "transactTime" |>
+      Option.map ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) ;
+    resp.buy_sell <- Some side ;
+    resp.unique_execution_id <- Some (string_exn o "execID") ;
+    write_message w `historical_order_fill_response
+      DTC.gen_historical_order_fill_response resp
+  end ;
+  Log.debug log_dtc "-> [%s] Historical Order Fills Response %d" addr nb_msgs
 
 let historical_order_fills_request addr w msg =
   let req = DTC.parse_historical_order_fills_request msg in
@@ -976,8 +973,10 @@ let historical_order_fills_request addr w msg =
   don't_wait_for begin
     REST.Execution.trade_history
       ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
-    | Ok (_resp, body) ->
-      send_historical_order_fills_response req addr w body
+    | Ok (_resp, `List orders) ->
+      send_historical_order_fills_response req addr w orders
+    | Ok (_resp, #Yojson.Safe.json) ->
+      invalid_arg "bitmex historical order fills response"
     | Error err ->
       (* TODO: reject on error *)
       Log.error log_bitmex "%s" @@ Error.to_string_hum err
