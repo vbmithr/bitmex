@@ -892,10 +892,10 @@ let open_orders_request addr w msg =
   Log.debug log_dtc "<- [%s] Open Orders Request" addr ;
   let nb_msgs, open_orders = Uuid.Table.fold order  ~init:(0, [])
       ~f:begin fun ~key:_ ~data ((nb_open_orders, os) as acc) ->
-        match RespObj.(string_exn data "ordStatus") with
-        | "New"
-        | "PartiallyFilled"
-        | "PendingCancel" -> (succ nb_open_orders, data :: os)
+        match RespObj.(string_exn data "ordStatus") |> OrdStatus.of_string with
+        | New
+        | PartiallyFilled
+        | PendingCancel -> (succ nb_open_orders, data :: os)
         | _ -> acc
       end
   in
