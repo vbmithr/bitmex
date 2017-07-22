@@ -961,6 +961,15 @@ let send_historical_order_fills_response req addr w orders =
   end ;
   Log.debug log_dtc "-> [%s] Historical Order Fills Response %d" addr nb_msgs
 
+let reject_historical_order_fills_request ?request_id w k =
+  let rej = DTC.default_historical_order_fills_reject () in
+  rej.request_id <- request_id ;
+  Printf.ksprintf begin fun reject_text ->
+    rej.reject_text <- Some reject_text ;
+    write_message w `historical_order_fills_reject
+      DTC.gen_historical_order_fills_reject rej
+  end k
+
 let historical_order_fills_request addr w msg =
   let req = DTC.parse_historical_order_fills_request msg in
   let { Connection.key ; secret } = Connection.find_exn addr in
@@ -978,8 +987,9 @@ let historical_order_fills_request addr w msg =
     | Ok (_resp, #Yojson.Safe.json) ->
       invalid_arg "bitmex historical order fills response"
     | Error err ->
-      (* TODO: reject on error *)
-      Log.error log_bitmex "%s" @@ Error.to_string_hum err
+      Log.error log_bitmex "%s" @@ Error.to_string_hum err ;
+      reject_historical_order_fills_request  ?request_id:req.request_id w
+        "Error fetching historical order fills from BitMEX"
   end
 
 let trade_accounts_request addr w msg =
