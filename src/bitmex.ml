@@ -995,12 +995,10 @@ let historical_order_fills_request addr w msg =
   Log.debug log_dtc "<- [%s] Historical Order Fills Request" addr ;
   don't_wait_for begin
     get_trade_history ?orderID:req.server_order_id ~key ~secret () >>| function
-    | Ok (_resp, `List []) ->
+    | Ok (_resp, []) ->
       write_no_historical_order_fills req w
-    | Ok (_resp, `List orders) ->
+    | Ok (_resp, orders) ->
       send_historical_order_fills_response req addr w orders
-    | Ok (_resp, #Yojson.Safe.json) ->
-      invalid_arg "bitmex historical order fills response"
     | Error err ->
       Log.error log_bitmex "%s" @@ Error.to_string_hum err ;
       reject_historical_order_fills_request  ?request_id:req.request_id w
