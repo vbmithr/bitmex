@@ -1220,18 +1220,17 @@ let cancel_replace_order addr w msg =
   else if time_in_force <> `tif_unset then
     reject_cancel_replace_order req addr w
       "Modification of time in force is not supported by BitMEX"
-  else match req.server_order_id with
+  else
+    match Option.bind req.server_order_id ~f:begin fun orderID ->
+        Uuid.Table.find order (Uuid.of_string orderID)
+      end with
     | None ->
       reject_cancel_replace_order req addr w
-        "No server order id set"
-    | Some orderID ->
-      match Uuid.Table.find order (Uuid.of_string orderID) with
-      | None ->
-        reject_cancel_replace_order req addr w
-          "internal error: order id %s not found in db" orderID
-      | Some o ->
-        let ordType = RespObj.string_exn o "ordType" |> OrderType.of_string in
-        don't_wait_for (amend_order addr w req key secret orderID ordType)
+        "Cancel Replace Order: Order Not Found"
+    | Some o ->
+      let orderID = RespObj.string_exn o "orderID" |> Uuid.of_string in
+      let ordType = RespObj.string_exn o "ordType" |> OrderType.of_string in
+      don't_wait_for (amend_order addr w req key secret orderID ordType)
 
 let reject_cancel_order (req : DTC.Cancel_order.t) addr w k =
   let rej = DTC.default_order_update () in
