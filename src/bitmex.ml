@@ -970,6 +970,17 @@ let reject_historical_order_fills_request ?request_id w k =
       DTC.gen_historical_order_fills_reject rej
   end k
 
+let write_no_historical_order_fills req w =
+  let u = DTC.default_historical_order_fill_response () in
+  u.total_number_messages <- Some 1l ;
+  u.message_number <- Some 1l ;
+  u.request_id <- req.DTC.Historical_order_fills_request.request_id ;
+  u.server_order_id <- req.server_order_id ;
+  u.trade_account <- req.trade_account ;
+  u.no_order_fills <- Some true ;
+  write_message w `historical_order_fill_response
+    DTC.gen_historical_order_fill_response u
+
 let historical_order_fills_request addr w msg =
   let req = DTC.parse_historical_order_fills_request msg in
   let { Connection.key ; secret } = Connection.find_exn addr in
@@ -982,6 +993,8 @@ let historical_order_fills_request addr w msg =
   don't_wait_for begin
     REST.Execution.trade_history
       ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
+    | Ok (_resp, `List []) ->
+      write_no_historical_order_fills req w
     | Ok (_resp, `List orders) ->
       send_historical_order_fills_response req addr w orders
     | Ok (_resp, #Yojson.Safe.json) ->
