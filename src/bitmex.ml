@@ -877,7 +877,7 @@ let market_depth_request addr w msg =
   | _ ->
     reject_market_data_request addr w "Market Data Request: wrong request"
 
-let write_empty_order_update req w =
+let write_no_open_orders req w =
   let u = DTC.default_order_update () in
   u.total_num_messages <- Some 1l ;
   u.message_number <- Some 1l ;
@@ -903,10 +903,10 @@ let open_orders_request addr w msg =
   List.iteri open_orders ~f:begin fun msg_number o ->
     ignore (write_order_update ~nb_msgs ~msg_number w o)
   end ;
-  if nb_msgs = 0 then write_empty_order_update req w ;
+  if nb_msgs = 0 then write_no_open_orders req w ;
   Log.debug log_dtc "-> [%s] %d orders" addr nb_msgs
 
-let write_empty_position_update req w =
+let write_no_positions req w =
   let u = DTC.default_position_update () in
   u.total_number_messages <- Some 1l ;
   u.message_number <- Some 1l ;
@@ -932,7 +932,7 @@ let current_positions_request addr w msg =
       ~nb_msgs
       ~msg_number:(succ i) w
   end;
-  if nb_msgs = 0 then write_empty_position_update req w ;
+  if nb_msgs = 0 then write_no_positions req w ;
   Log.debug log_dtc "-> [%s] %d positions" addr nb_msgs
 
 let send_historical_order_fills_response req addr w orders =
