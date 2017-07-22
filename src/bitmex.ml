@@ -1018,7 +1018,7 @@ let trade_accounts_request addr w msg =
   write_message w `trade_account_response  DTC.gen_trade_account_response resp ;
   Log.debug log_dtc "-> [%s] Trade Account Response %d" addr account
 
-let write_account_balance_reject ?request_id addr w k =
+let reject_account_balance_request ?request_id addr w k =
   let rej = DTC.default_account_balance_reject () in
   rej.request_id <- request_id ;
   Printf.ksprintf begin fun reject_text ->
@@ -1064,7 +1064,7 @@ let account_balance_request addr w msg =
       | None ->
         write_no_balances req addr w
       | exception _ ->
-        write_account_balance_reject ?request_id:req.request_id addr w
+        reject_account_balance_request ?request_id:req.request_id addr w
           "Invalid trade account %s" trade_account
 
 let reject_order (req : DTC.Submit_new_single_order.t) w k =
