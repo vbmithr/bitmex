@@ -981,18 +981,20 @@ let write_no_historical_order_fills req w =
   write_message w `historical_order_fill_response
     DTC.gen_historical_order_fill_response u
 
+let get_trade_history ?orderID ~key ~secret () =
+  let filter = `Assoc begin List.filter_opt [
+      Option.map orderID ~f:(fun id -> ("orderID", `String id)) ;
+      Some ("execType", `String "Trade")
+    ] end in
+  REST.Execution.trade_history
+    ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter ()
+
 let historical_order_fills_request addr w msg =
   let req = DTC.parse_historical_order_fills_request msg in
   let { Connection.key ; secret } = Connection.find_exn addr in
   Log.debug log_dtc "<- [%s] Historical Order Fills Request" addr ;
-  let filter = `Assoc begin List.filter_opt [
-      Option.map req.server_order_id ~f:(fun id -> ("orderID", `String id)) ;
-      Some ("execType", `String "Trade")
-    ] end
-  in
   don't_wait_for begin
-    REST.Execution.trade_history
-      ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
+    get_trade_history ?orderID:req.server_order_id ~key ~secret () >>| function
     | Ok (_resp, `List []) ->
       write_no_historical_order_fills req w
     | Ok (_resp, `List orders) ->
