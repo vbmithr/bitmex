@@ -877,11 +877,12 @@ let market_depth_request addr w msg =
   | _ ->
     reject_market_data_request addr w "Market Data Request: wrong request"
 
-let write_empty_order_update ?request_id w =
+let write_empty_order_update req w =
   let u = DTC.default_order_update () in
   u.total_num_messages <- Some 1l ;
   u.message_number <- Some 1l ;
-  u.request_id <- request_id ;
+  u.request_id <- req.DTC.Open_orders_request.request_id ;
+  u.trade_account <- req.trade_account ;
   u.no_orders <- Some true ;
   u.order_update_reason <- Some `open_orders_request_response ;
   write_message w `order_update DTC.gen_order_update u
@@ -902,14 +903,15 @@ let open_orders_request addr w msg =
   List.iteri open_orders ~f:begin fun msg_number o ->
     ignore (write_order_update ~nb_msgs ~msg_number w o)
   end ;
-  if nb_msgs = 0 then write_empty_order_update ?request_id:req.request_id w ;
+  if nb_msgs = 0 then write_empty_order_update req w ;
   Log.debug log_dtc "-> [%s] %d orders" addr nb_msgs
 
-let write_empty_position_update ?request_id w =
+let write_empty_position_update req w =
   let u = DTC.default_position_update () in
   u.total_number_messages <- Some 1l ;
   u.message_number <- Some 1l ;
-  u.request_id <- request_id ;
+  u.request_id <- req.DTC.Current_positions_request.request_id ;
+  u.trade_account <- req.trade_account ;
   u.no_positions <- Some true ;
   u.unsolicited <- Some false ;
   write_message w `position_update DTC.gen_position_update u
@@ -930,16 +932,17 @@ let current_positions_request addr w msg =
       ~nb_msgs
       ~msg_number:(succ i) w
   end;
-  if nb_msgs = 0 then write_empty_position_update ?request_id:req.request_id w ;
+  if nb_msgs = 0 then write_empty_position_update req w ;
   Log.debug log_dtc "-> [%s] %d positions" addr nb_msgs
 
-let send_historical_order_fills_response ?request_id addr w = function
+let send_historical_order_fills_response req addr w = function
   | `List orders ->
     let open RespObj in
     let resp = DTC.default_historical_order_fill_response () in
     let nb_msgs = List.length orders in
     resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
-    resp.request_id <- request_id ;
+    resp.request_id <- req.DTC.Historical_order_fills_request.request_id ;
+    resp.trade_account <- req.trade_account ;
     List.iteri orders ~f:begin fun i o ->
       let o = of_json o in
       let side = string_exn o "side" |> Side.of_string in
@@ -974,7 +977,7 @@ let historical_order_fills_request addr w msg =
     REST.Execution.trade_history
       ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
     | Ok (_resp, body) ->
-      send_historical_order_fills_response ?request_id:req.request_id addr w body
+      send_historical_order_fills_response req addr w body
     | Error err ->
       (* TODO: reject on error *)
       Log.error log_bitmex "%s" @@ Error.to_string_hum err
@@ -1002,10 +1005,10 @@ let write_account_balance_reject ?request_id addr w k =
     Log.debug log_dtc "-> [%s] Account Balance Reject" addr ;
   end k
 
-let write_no_balances ?trade_account ?request_id addr w =
+let write_no_balances req addr w =
   let resp = DTC.default_account_balance_update () in
-  resp.request_id <- request_id ;
-  resp.trade_account <- trade_account ;
+  resp.request_id <- req.DTC.Account_balance_request.request_id ;
+  resp.trade_account <- req.trade_account ;
   resp.total_number_messages <- Some 1l ;
   resp.message_number <- Some 1l ;
   resp.no_account_balances <- Some true ;
@@ -1021,7 +1024,7 @@ let account_balance_request addr w msg =
   let req = DTC.parse_account_balance_request msg in
   let { Connection.margin } = Connection.find_exn addr in
   let nb_msgs = IS.Table.length margin in
-  if nb_msgs = 0 then write_no_balances ?request_id:req.request_id addr w
+  if nb_msgs = 0 then write_no_balances req addr w
   else match req.trade_account with
     | None
     | Some "" ->
@@ -1037,7 +1040,7 @@ let account_balance_request addr w msg =
         write_account_balance_update
           ~msg_number:1 ~nb_msgs:1 addr w Int.(of_string trade_account) obj
       | None ->
-        write_no_balances ~trade_account ?request_id:req.request_id addr w
+        write_no_balances req addr w
       | exception _ ->
         write_account_balance_reject ?request_id:req.request_id addr w
           "Invalid trade account %s" trade_account
