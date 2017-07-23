@@ -30,6 +30,8 @@ let log_bitmex = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[s
 let log_dtc = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 let log_ws = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 
+let ws_feed_connected : unit Condition.t = Condition.create ()
+
 module Connection = struct
   type t = {
     addr: string;
@@ -1525,6 +1527,10 @@ let cancel_order addr w msg =
 
 let dtcserver ~server ~port =
   let server_fun addr r w =
+    don't_wait_for begin
+      Condition.wait ws_feed_connected >>= fun () ->
+      Deferred.all_unit [Writer.close w ; Reader.close r]
+    end ;
     let addr = Socket.Address.Inet.to_string addr in
     (* So that process does not allocate all the time. *)
     let rec handle_chunk consumed buf ~pos ~len =
@@ -1722,6 +1728,7 @@ let bitmex_ws () =
   let connected = Condition.create () in
   let rec resubscribe () =
     Condition.wait connected >>= fun () ->
+    Condition.broadcast ws_feed_connected () ;
     Pipe.write to_ws_w @@ MD.to_yojson @@
     MD.subscribe ~id:my_uuid ~topic:my_topic >>= fun () ->
     Deferred.List.iter (Connection.to_alist ())
