@@ -675,7 +675,9 @@ let logon_request addr w msg =
       Result.fail "No login provided, data only"
   end
 
-let heartbeat addr w msg =  Log.debug log_dtc "<- [%s] Heartbeat" addr
+let heartbeat addr w msg =
+  (* Log.debug log_dtc "<- [%s] Heartbeat" addr *)
+  ()
 
 let security_definition_reject addr w request_id k =
   Printf.ksprintf begin fun msg ->
@@ -906,7 +908,7 @@ let open_orders_request addr w msg =
     ignore (write_order_update ~nb_msgs ~msg_number w o)
   end ;
   if nb_msgs = 0 then write_no_open_orders req w ;
-  Log.debug log_dtc "-> [%s] %d orders" addr nb_msgs
+  Log.debug log_dtc "-> [%s] Open Orders Response (%d orders)" addr nb_msgs
 
 let write_no_positions req w =
   let u = DTC.default_position_update () in
@@ -1018,7 +1020,7 @@ let trade_accounts_request addr w msg =
   resp.message_number <- Some 1l ;
   resp.trade_account <- Some Int.(to_string account) ;
   write_message w `trade_account_response  DTC.gen_trade_account_response resp ;
-  Log.debug log_dtc "-> [%s] Trade Account Response %d" addr account
+  Log.debug log_dtc "-> [%s] Trade Account Response (%d)" addr account
 
 let reject_account_balance_request ?request_id addr w k =
   let rej = DTC.default_account_balance_reject () in
@@ -1038,11 +1040,11 @@ let write_no_balances req addr w =
   resp.no_account_balances <- Some true ;
   resp.unsolicited <- Some false ;
   write_message w `account_balance_update  DTC.gen_account_balance_update resp ;
-  Log.debug log_dtc "-> [%s] no account balance" addr
+  Log.debug log_dtc "-> [%s] No Account Balance" addr
 
 let write_account_balance_update ?request_id ~msg_number ~nb_msgs addr w account_id obj =
   write_balance_update ?request_id ~msg_number ~nb_msgs w obj ;
-  Log.debug log_dtc "-> [%s] account balance %d" addr account_id
+  Log.debug log_dtc "-> [%s] Account Balance Response (%d)" addr account_id
 
 let account_balance_request addr w msg =
   let req = DTC.parse_account_balance_request msg in
