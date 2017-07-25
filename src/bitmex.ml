@@ -383,6 +383,14 @@ module TradeHistory = struct
     let open Option in
     String.Table.find table key >>= fun trades ->
     String.Map.find trades orderID
+
+  let set ~key trade =
+    let orderID = RespObj.string_exn trade "orderID" in
+    let data = Option.value_map
+      (String.Table.find table key)
+      ~default:(String.Map.singleton orderID trade)
+      ~f:(String.Map.add ~key:orderID ~data:trade) in
+    String.Table.set table ~key ~data
 end
 
 let send_heartbeat { Connection.addr ; w } span =
@@ -594,17 +602,19 @@ let process_positions { Connection.addr ; w ; position } partial_iv action posit
   end;
   if action = Partial then Ivar.fill_if_empty partial_iv ()
 
-let process_execs { Connection.addr ; w } action execs =
-  let fold_f i e =
-    let symbol = RespObj.string_exn e "symbol" in
-    match action with
-    | WS.Response.Update.Insert ->
+let process_execs { Connection.addr ; w ; key } execs =
+  let nb_execs = List.fold_left execs ~init:0 ~f:begin fun i e ->
+      let e = RespObj.of_json e in
+      let symbol = RespObj.string_exn e "symbol" in
+      let execType = Option.map (RespObj.string e "execType") ~f:ExecType.of_string in
+      let ordStatus = Option.map (RespObj.string e "ordStatus") ~f:OrdStatus.of_string in
       Log.debug log_bitmex "<- [%s] exec %s" addr symbol;
+      begin match execType, ordStatus with
+        | Some Trade, Some Filled -> TradeHistory.set ~key e
+        | _ -> ()
+      end ;
       if write_order_update ~nb_msgs:1 ~msg_number:1 w e then succ i else i
-    | _ -> i
-  in
-  let execs = List.map execs ~f:RespObj.of_json in
-  let nb_execs = List.fold_left execs ~init:0 ~f:fold_f in
+    end in
   if nb_execs > 0 then Log.debug log_dtc "-> [%s] OrderUpdate %d" addr nb_execs
 
 let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position; } as c) =
@@ -617,7 +627,7 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position;
       | "order", action, orders -> process_orders c order_iv action orders
       | "margin", action, margins -> process_margins c margin_iv action margins
       | "position", action, positions -> process_positions c position_iv action positions
-      | "execution", action, execs -> process_execs c action execs
+      | "execution", action, execs -> process_execs c execs
       | table, _, _ -> Log.error log_bitmex "Unknown table %s" table
   in
   Pipe.write client_ws_w @@ Subscribe c >>= fun () ->
