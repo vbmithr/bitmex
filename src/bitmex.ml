@@ -1724,11 +1724,11 @@ let on_ws_msg to_ws_w my_uuid msg =
   let open Bmex_ws in
   let bitmex_topics = Topic.[Instrument; Quote; OrderBookL2; Trade] in
   let clients_topics = Topic.[Order; Execution; Position; Margin] in
-  match MD.of_yojson msg with
+  match MD.of_yojson ~log:log_bitmex msg with
   | Unsubscribe _ -> ()
   | Subscribe _ -> ()
   | Message { stream = { id ; topic } ; payload } ->
-    match Response.of_yojson payload, topic = my_topic with
+    match Response.of_yojson ~log:log_bitmex payload, topic = my_topic with
 
     (* Server *)
     | Response.Welcome _, true ->
