@@ -432,50 +432,60 @@ let status_reason_of_execType_ordStatus e =
   | _, Settlement -> raise Exit
   | _ -> fail_ordStatus_execType ~ordStatus ~execType
 
-let write_order_update ~nb_msgs ~msg_number w e =
+let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ~status ~reason w o =
   let open RespObj in
-  match status_reason_of_execType_ordStatus e with
-  | exception Exit -> false
-  | exception Invalid_argument msg ->
-    Log.error log_bitmex "Not sending order update for %s" msg ;
-    false
-  | status, reason ->
-    let u = DTC.default_order_update () in
-    let price = float_or_null_exn ~default:Float.max_finite_value e "price" in
-    let stopPx = float_or_null_exn ~default:Float.max_finite_value e "stopPx" in
-    let side = Option.map (string e "side") ~f:Side.of_string in
-    let ordType = Option.map (string e "ordType") ~f:OrderType.of_string in
-    let timeInForce = Option.map (string e "timeInForce")~f:TimeInForce.of_string in
-    let ts = Option.map (string e "transactTime")
-       ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) in
-    let p1, p2 = OrderType.to_p1_p2 ~stopPx ~price
-        (Option.value ~default:`order_type_unset ordType) in
-    u.total_num_messages <- Some (Int32.of_int_exn nb_msgs) ;
-    u.message_number <- Some (Int32.of_int_exn msg_number) ;
-    u.symbol <- (string e "symbol") ;
-    u.exchange <- Some !my_exchange ;
-    u.client_order_id <- string e "clOrdID" ;
-    u.server_order_id <- string e "orderID" ;
-    u.exchange_order_id <- string e "orderID" ;
-    u.order_type <- ordType ;
-    u.order_status <- Some status ;
-    u.order_update_reason <- Some reason ;
-    u.buy_sell <- side ;
-    u.price1 <- p1 ;
-    u.price2 <- p2 ;
-    u.time_in_force <- timeInForce ;
-    u.order_quantity <- Option.map (int64 e "orderQty") ~f:Int64.to_float ;
-    u.filled_quantity <- Option.map (int64 e "cumQty") ~f:Int64.to_float ;
-    u.remaining_quantity <- Option.map (int64 e "leavesQty") ~f:Int64.to_float ;
-    u.average_fill_price <- (float e "avgPx") ;
-    u.last_fill_price <- (float e "lastPx") ;
-    u.last_fill_date_time <- ts ;
-    u.last_fill_quantity <- Option.map ~f:Int64.to_float (int64 e "lastQty") ;
-    u.last_fill_execution_id <- string e "execID" ;
-    u.trade_account <- Option.map ~f:Int64.to_string (int64 e "account") ;
-    u.free_form_text <- string e "text" ;
-    write_message w `order_update DTC.gen_order_update u ;
-    true
+  let cumQty = Option.map (int64 o "cumQty") ~f:Int64.to_float in
+  let leavesQty = Option.map (int64 o "leavesQty") ~f:Int64.to_float in
+  let orderQty = Option.map2 cumQty leavesQty ~f:Float.add in
+  let u = DTC.default_order_update () in
+  let price = float_or_null_exn ~default:Float.max_finite_value o "price" in
+  let stopPx = float_or_null_exn ~default:Float.max_finite_value o "stopPx" in
+  let side = Option.map (string o "side") ~f:Side.of_string in
+  let ordType = Option.map (string o "ordType") ~f:OrderType.of_string in
+  let timeInForce = Option.map (string o "timeInForce")~f:TimeInForce.of_string in
+  let ts = Option.map (string o "transactTime")
+      ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) in
+  let p1, p2 = OrderType.to_p1_p2 ~stopPx ~price
+      (Option.value ~default:`order_type_unset ordType) in
+  u.request_id <- request_id ;
+  u.total_num_messages <- Some (Int32.of_int_exn nb_msgs) ;
+  u.message_number <- Some (Int32.of_int_exn msg_number) ;
+  u.symbol <- (string o "symbol") ;
+  u.exchange <- Some !my_exchange ;
+  u.client_order_id <- string o "clOrdID" ;
+  u.server_order_id <- string o "orderID" ;
+  u.exchange_order_id <- string o "orderID" ;
+  u.order_type <- ordType ;
+  u.order_status <- Some status ;
+  u.order_update_reason <- Some reason ;
+  u.buy_sell <- side ;
+  u.price1 <- p1 ;
+  u.price2 <- p2 ;
+  u.time_in_force <- timeInForce ;
+  u.order_quantity <- orderQty ;
+  u.filled_quantity <- cumQty ;
+  u.remaining_quantity <- leavesQty ;
+  u.average_fill_price <- (float o "avgPx") ;
+  u.last_fill_price <- (float o "lastPx") ;
+  u.last_fill_date_time <- ts ;
+  u.last_fill_quantity <- Option.map ~f:Int64.to_float (int64 o "lastQty") ;
+  u.last_fill_execution_id <- string o "execID" ;
+  u.trade_account <- Option.map ~f:Int64.to_string (int64 o "account") ;
+  u.free_form_text <- string o "text" ;
+  write_message w `order_update DTC.gen_order_update u
+
+let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ?status_reason w o =
+  match status_reason with
+  | Some (status, reason) ->
+      write_order_update ?request_id ~status ~reason w o
+  | None ->
+      match status_reason_of_execType_ordStatus o with
+      | exception Exit -> ()
+      | exception Invalid_argument msg ->
+          Log.error log_bitmex "Not sending order update for %s" msg ;
+          ()
+      | status, reason ->
+          write_order_update ?request_id ~status ~reason w o
 
 let write_position_update ?request_id ~nb_msgs ~msg_number w p =
   let symbol = RespObj.string p "symbol" in
@@ -603,7 +613,7 @@ let process_positions { Connection.addr ; w ; position } partial_iv action posit
   if action = Partial then Ivar.fill_if_empty partial_iv ()
 
 let process_execs { Connection.addr ; w ; key } execs =
-  let nb_execs = List.fold_left execs ~init:0 ~f:begin fun i e ->
+  List.iter execs ~f:begin fun e ->
       let e = RespObj.of_json e in
       let symbol = RespObj.string_exn e "symbol" in
       let execType = Option.map (RespObj.string e "execType") ~f:ExecType.of_string in
@@ -613,9 +623,9 @@ let process_execs { Connection.addr ; w ; key } execs =
         | Some Trade, Some Filled -> TradeHistory.set ~key e
         | _ -> ()
       end ;
-      if write_order_update ~nb_msgs:1 ~msg_number:1 w e then succ i else i
-    end in
-  if nb_execs > 0 then Log.debug log_dtc "-> [%s] OrderUpdate %d" addr nb_execs
+      write_order_update ~nb_msgs:1 ~msg_number:1 w e
+    end ;
+  Log.debug log_dtc "-> [%s] Sent Order Updates" addr
 
 let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position; } as c) =
   let order_iv = Ivar.create () in
@@ -989,14 +999,18 @@ let send_historical_order_fills_response req addr w trades =
   resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
   resp.request_id <- req.DTC.Historical_order_fills_request.request_id ;
   resp.trade_account <- req.trade_account ;
-  String.Map.fold trades ~init:1l ~f:begin fun ~key:_ ~data:t message_number ->
+  let _ = String.Map.fold trades ~init:1l ~f:begin fun ~key:_ ~data:t message_number ->
+    let cumQty = int64 t "cumQty" in
+    let leavesQty = int64 t "leavesQty" in
+    let orderQty =
+      Option.map2 cumQty leavesQty ~f:Int64.(fun a b -> to_float (a + b)) in
     let side = string_exn t "side" |> Side.of_string in
     resp.message_number <- Some message_number ;
     resp.symbol <- Some (string_exn t "symbol") ;
     resp.exchange <- Some !my_exchange ;
     resp.server_order_id <- Some (string_exn t "orderID") ;
     resp.price <- Some (float_exn t "avgPx") ;
-    resp.quantity <- Some Float.(of_int64 (int64_exn t "orderQty")) ;
+    resp.quantity <- orderQty ;
     resp.date_time <-
       string t "transactTime" |>
       Option.map ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) ;
@@ -1005,7 +1019,7 @@ let send_historical_order_fills_response req addr w trades =
     write_message w `historical_order_fill_response
       DTC.gen_historical_order_fill_response resp ;
     Int32.succ message_number
-  end |> fun _ ->
+  end in
   Log.debug log_dtc "-> [%s] Historical Order Fills Response (%d fills)" addr nb_msgs
 
 let reject_historical_order_fills_request ?request_id w k =
