@@ -358,7 +358,7 @@ module TradeHistory = struct
 
   let get ~key ~secret =
     let filter = `Assoc ["execType", `String "Trade"] in
-    REST.Execution.all_trade_history
+    REST.Execution.trade_history ~count:500
       ~buf ~log:log_bitmex ~testnet:!use_testnet
       ~filter ~key ~secret () >>| function
     | Error err ->
