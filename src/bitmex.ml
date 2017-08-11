@@ -374,10 +374,20 @@ module TradeHistory = struct
       String.Table.set table key trades ;
       Ok trades
 
-  let get ~key ~secret =
+  let filter_trades min_ts trades =
+    String.Map.filter trades ~f:begin fun t ->
+      let ts =
+        Option.value_map (RespObj.string t "transactTime")
+          ~default:Time_ns.max_value ~f:Time_ns.of_string in
+      Time_ns.(ts > min_ts)
+    end
+
+  let get ?(min_ts=Time_ns.epoch) ~key ~secret =
     match String.Table.find table key with
-    | Some trades -> Deferred.Or_error.return trades
-    | None -> get ~key ~secret
+    | Some trades ->
+      Deferred.Or_error.return (filter_trades min_ts trades)
+    | None ->
+      Deferred.Or_error.(get ~key ~secret >>| filter_trades min_ts)
 
   let get_one ~key ~orderID =
     let open Option in
@@ -1045,12 +1055,15 @@ let write_no_historical_order_fills req w =
 
 let historical_order_fills_request addr w msg =
   let req = DTC.parse_historical_order_fills_request msg in
+  let min_ts = Option.map req.number_of_days ~f:begin fun i ->
+      Time_ns.(sub (now ()) (Span.of_day (Int32.to_float i)))
+    end in
   let { Connection.key ; secret } = Connection.find_exn addr in
   match Option.value ~default:"" req.server_order_id with
   | "" ->
     Log.debug log_dtc "<- [%s] Historical Order Fills Request" addr ;
     don't_wait_for begin
-      TradeHistory.get ~key ~secret >>| function
+      TradeHistory.get ?min_ts ~key ~secret >>| function
       | Ok trades when String.Map.is_empty trades ->
         write_no_historical_order_fills req w ;
         Log.debug log_dtc "-> [%s] No Order Fills" addr ;
