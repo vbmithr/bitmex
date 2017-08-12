@@ -420,28 +420,6 @@ let fail_ordStatus_execType ~ordStatus ~execType =
     (ExecType.show execType)
     ()
 
-let status_reason_of_execType_ordStatus e =
-  let ordStatus = RespObj.(string_exn e "ordStatus") |> OrdStatus.of_string in
-  let execType = RespObj.(string_exn e "execType") |> ExecType.of_string in
-  match ordStatus, execType with
-
-  | New, New
-  | New, TriggeredOrActivatedBySystem -> `order_status_open, `new_order_accepted
-  | New, Replaced -> `order_status_open, `order_cancel_replace_complete
-  | New, Restated -> `order_status_open, `general_order_update
-
-  | PartiallyFilled, Trade -> `order_status_partially_filled, `order_filled_partially
-  | PartiallyFilled, Replaced -> `order_status_partially_filled, `order_cancel_replace_complete
-  | PartiallyFilled, Restated -> `order_status_partially_filled, `general_order_update
-
-  | Filled, Trade -> `order_status_filled, `order_filled
-  | Canceled, Canceled -> `order_status_canceled, `order_canceled
-  | Rejected, Rejected -> `order_status_rejected, `new_order_rejected
-
-  | _, Funding -> raise Exit
-  | _, Settlement -> raise Exit
-  | _ -> fail_ordStatus_execType ~ordStatus ~execType
-
 let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ~status ~reason w o =
   let open RespObj in
   let cumQty = Option.map (int64 o "cumQty") ~f:Int64.to_float in
@@ -484,6 +462,28 @@ let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ~status ~reason 
   u.info_text <- string o "ordRejReason" ;
   u.free_form_text <- string o "text" ;
   write_message w `order_update DTC.gen_order_update u
+
+let status_reason_of_execType_ordStatus e =
+  let ordStatus = RespObj.(string_exn e "ordStatus") |> OrdStatus.of_string in
+  let execType = RespObj.(string_exn e "execType") |> ExecType.of_string in
+  match ordStatus, execType with
+
+  | New, New
+  | New, TriggeredOrActivatedBySystem -> `order_status_open, `new_order_accepted
+  | New, Replaced -> `order_status_open, `order_cancel_replace_complete
+  | New, Restated -> `order_status_open, `general_order_update
+
+  | PartiallyFilled, Trade -> `order_status_partially_filled, `order_filled_partially
+  | PartiallyFilled, Replaced -> `order_status_partially_filled, `order_cancel_replace_complete
+  | PartiallyFilled, Restated -> `order_status_partially_filled, `general_order_update
+
+  | Filled, Trade -> `order_status_filled, `order_filled
+  | Canceled, Canceled -> `order_status_canceled, `order_canceled
+  | Rejected, Rejected -> `order_status_rejected, `new_order_rejected
+
+  | _, Funding -> raise Exit
+  | _, Settlement -> raise Exit
+  | _ -> fail_ordStatus_execType ~ordStatus ~execType
 
 let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ?status_reason w o =
   match status_reason with
@@ -959,17 +959,19 @@ let open_orders_request addr w msg =
   let req = DTC.parse_open_orders_request msg in
   let { Connection.order } = Connection.find_exn addr in
   Log.debug log_dtc "<- [%s] Open Orders Request" addr ;
-  let nb_msgs, open_orders = Uuid.Table.fold order  ~init:(0, [])
-      ~f:begin fun ~key:_ ~data ((nb_open_orders, os) as acc) ->
-        match RespObj.(string_exn data "ordStatus") |> OrdStatus.of_string with
-        | New
-        | PartiallyFilled
-        | PendingCancel -> (succ nb_open_orders, data :: os)
-        | _ -> acc
-      end
+  let nb_msgs, open_orders =
+    Uuid.Table.fold order  ~init:(0, []) ~f:begin fun ~key:_ ~data ((nb_open_orders, os) as acc) ->
+      let ordStatus = RespObj.(string_exn data "ordStatus") |> OrdStatus.of_string in
+      match ordStatus with
+      | New -> (succ nb_open_orders, (`order_status_open, data) :: os)
+      | PartiallyFilled -> (succ nb_open_orders, (`order_status_partially_filled, data) :: os)
+      | PendingCancel -> (succ nb_open_orders, (`order_status_pending_cancel, data) :: os)
+      | _ -> acc
+    end
   in
-  List.iteri open_orders ~f:begin fun msg_number o ->
-    ignore (write_order_update ~nb_msgs ~msg_number w o)
+  List.iteri open_orders ~f:begin fun msg_number (ordStatus, o) ->
+    let status_reason = ordStatus, `open_orders_request_response in
+    write_order_update ~status_reason ~nb_msgs ~msg_number w o
   end ;
   if nb_msgs = 0 then write_no_open_orders req w ;
   Log.debug log_dtc "-> [%s] Open Orders Response (%d orders)" addr nb_msgs
