@@ -41,8 +41,8 @@ module Connection = struct
     mutable ws_uuid: Uuid.t;
     key: string;
     secret: string;
-    position: RespObj.t IS.Table.t; (* indexed by account, symbol *)
-    margin: RespObj.t IS.Table.t; (* indexed by account, currency *)
+    position: RespObj.t String.Table.t; (* indexed by symbol *)
+    margin: RespObj.t String.Table.t; (* indexed by currency *)
     order: RespObj.t Uuid.Table.t; (* indexed by orderID *)
     subs: int32 String.Table.t;
     rev_subs: string Int32.Table.t;
@@ -57,8 +57,8 @@ module Connection = struct
     let ws_r, ws_w = Pipe.create () in
     {
       addr ; w ; ws_r ; ws_w ; key ; secret ;
-      position = IS.Table.create () ;
-      margin = IS.Table.create () ;
+      position = String.Table.create () ;
+      margin = String.Table.create () ;
       order = Uuid.Table.create () ;
       subs = String.Table.create () ;
       rev_subs = Int32.Table.create () ;
@@ -568,24 +568,23 @@ let process_orders { Connection.addr ; order } partial_iv action orders =
 let process_margins { Connection.addr ; w ; margin } partial_iv action margins =
   let margins = List.map margins ~f:RespObj.of_json in
   List.iteri margins ~f:begin fun i m ->
-    let a = RespObj.int_exn m "account" in
-    let c = RespObj.string_exn m "currency" in
+    let currency = RespObj.string_exn m "currency" in
     match action with
     | WS.Response.Update.Delete ->
-      IS.Table.remove margin (a, c);
+      String.Table.remove margin currency ;
       Log.debug log_bitmex "<- [%s] margin delete" addr
     | Insert
     | Partial ->
-      IS.Table.set margin ~key:(a, c) ~data:m;
+      String.Table.set margin ~key:currency ~data:m;
       Log.debug log_bitmex "<- [%s] margin insert/partial" addr;
       write_balance_update ~msg_number:1 ~nb_msgs:1 w m
     | Update ->
       if Ivar.is_full partial_iv then begin
-        let m = match IS.Table.find margin (a, c) with
+        let m = match String.Table.find margin currency with
           | None -> m
           | Some old_m -> RespObj.merge old_m m
         in
-        IS.Table.set margin ~key:(a, c) ~data:m;
+        String.Table.set margin ~key:currency ~data:m;
         write_balance_update ~msg_number:1 ~nb_msgs:1 w m ;
         Log.debug log_bitmex "<- [%s] margin update" addr
       end
@@ -595,29 +594,28 @@ let process_margins { Connection.addr ; w ; margin } partial_iv action margins =
 let process_positions { Connection.addr ; w ; position } partial_iv action positions =
   let positions = List.map positions ~f:RespObj.of_json in
   List.iter positions ~f:begin fun p ->
-    let a = RespObj.int_exn p "account" in
-    let s = RespObj.string_exn p "symbol" in
+    let symbol = RespObj.string_exn p "symbol" in
     match action with
     | WS.Response.Update.Delete ->
-      IS.Table.remove position (a, s);
+      String.Table.remove position symbol ;
       Log.debug log_bitmex "<- [%s] position delete" addr
     | Insert | Partial ->
-      IS.Table.set position ~key:(a, s) ~data:p;
+      String.Table.set position ~key:symbol ~data:p;
       if RespObj.bool_exn p "isOpen" then begin
         write_position_update ~nb_msgs:1 ~msg_number:1 w p ;
         Log.debug log_bitmex "<- [%s] position insert/partial" addr
       end
     | Update ->
       if Ivar.is_full partial_iv then begin
-        let old_p, p = match IS.Table.find position (a, s) with
+        let old_p, p = match String.Table.find position symbol with
           | None -> None, p
           | Some old_p -> Some old_p, RespObj.merge old_p p
         in
-        IS.Table.set position ~key:(a, s) ~data:p;
+        String.Table.set position ~key:symbol ~data:p;
         match old_p with
         | Some old_p when RespObj.bool_exn old_p "isOpen" ->
           write_position_update ~nb_msgs:1 ~msg_number:1 w p ;
-          Log.debug log_dtc "<- [%s] position update %s" addr s
+          Log.debug log_dtc "<- [%s] position update %s" addr symbol
         | _ -> ()
       end
   end;
@@ -990,7 +988,7 @@ let current_positions_request addr w msg =
   let req = DTC.parse_current_positions_request msg in
   let { Connection.position } = Connection.find_exn addr in
   Log.debug log_dtc "<- [%s] Current Positions Request" addr ;
-  let nb_msgs, open_positions = IS.Table.fold position ~init:(0, [])
+  let nb_msgs, open_positions = String.Table.fold position ~init:(0, [])
       ~f:begin fun ~key:_ ~data ((nb_open_ps, open_ps) as acc) ->
         if RespObj.bool_exn data "isOpen" then succ nb_open_ps, data :: open_ps
         else acc
@@ -1091,7 +1089,8 @@ let trade_accounts_request addr w msg =
   let req = DTC.parse_trade_accounts_request msg in
   let { Connection.margin } = Connection.find_exn addr in
   Log.debug log_dtc "<- [%s] Trade Accounts Request" addr ;
-  let account, _ = List.hd_exn @@ IS.Table.keys margin in
+  let margin = List.hd_exn (String.Table.data margin) in
+  let account = RespObj.int_exn margin "account" in
   let resp = DTC.default_trade_account_response () in
   resp.request_id <- req.request_id ;
   resp.total_number_messages <- Some 1l ;
@@ -1120,34 +1119,21 @@ let write_no_balances req addr w =
   write_message w `account_balance_update  DTC.gen_account_balance_update resp ;
   Log.debug log_dtc "-> [%s] No Account Balance" addr
 
-let write_account_balance_update ?request_id ~msg_number ~nb_msgs addr w account_id obj =
-  write_balance_update ?request_id ~msg_number ~nb_msgs w obj ;
-  Log.debug log_dtc "-> [%s] Account Balance Response (%d)" addr account_id
+let write_account_balance_update ?request_id ~msg_number ~nb_msgs w obj =
+  write_balance_update ?request_id ~msg_number ~nb_msgs w obj
 
 let account_balance_request addr w msg =
   let req = DTC.parse_account_balance_request msg in
   let { Connection.margin } = Connection.find_exn addr in
-  let nb_msgs = IS.Table.length margin in
-  if nb_msgs = 0 then write_no_balances req addr w
-  else match req.trade_account with
-    | None
-    | Some "" ->
-      Log.debug log_dtc "<- [%s] Account Balance Request" addr ;
-      IS.Table.fold margin ~init:1~f:begin fun ~key:(account_id, currency) ~data msg_number ->
-        write_account_balance_update ~msg_number ~nb_msgs addr w account_id data ;
-        succ msg_number
-      end |> ignore
-    | Some trade_account ->
-      Log.debug log_dtc "<- [%s] Account Balance Request (%s)" addr trade_account ;
-      match IS.Table.find margin (Int.of_string trade_account, "XBt") with
-      | Some obj ->
-        write_account_balance_update
-          ~msg_number:1 ~nb_msgs:1 addr w Int.(of_string trade_account) obj
-      | None ->
-        write_no_balances req addr w
-      | exception _ ->
-        reject_account_balance_request ?request_id:req.request_id addr w
-          "Invalid trade account %s" trade_account
+  let nb_msgs = String.Table.length margin in
+  Log.debug log_dtc "<- [%s] Account Balance Request" addr ;
+  let msg_sent =
+    String.Table.fold margin ~init:1 ~f:begin fun ~key:currency ~data msg_number ->
+      write_account_balance_update ~msg_number ~nb_msgs w data ;
+      Log.debug log_dtc "-> [%s] Account Balance Response (ALL)" addr ;
+      succ msg_number
+    end in
+  if msg_sent = 1 then write_no_balances req addr w
 
 let reject_order (req : DTC.Submit_new_single_order.t) w k =
   let rej = DTC.default_order_update () in
