@@ -333,27 +333,23 @@ let historical_price_data_request addr w msg =
   | None, _, _ ->
     reject_historical_price_data_request
       ~reason_code:`hpdr_unable_to_serve_data_do_not_retry
-      w req "Symbol not specified" ;
-    raise Exit
+      w req "Symbol not specified"
   | Some symbol, Some exchange, true when exchange = "BMEX" ->
     error "BMEX/BMEXT mismatch" ;
     reject_historical_price_data_request
       ~reason_code:`hpdr_unable_to_serve_data_do_not_retry
-      w req "BMEX/BMEX mismatch" ;
-    raise Exit
+      w req "BMEX/BMEX mismatch"
   | Some symbol, Some exchange, false when exchange = "BMEXT" ->
     error "BMEX/BMEXT mismatch" ;
     reject_historical_price_data_request
       ~reason_code:`hpdr_unable_to_serve_data_do_not_retry
-      w req "BMEX/BMEX mismatch" ;
-    raise Exit
+      w req "BMEX/BMEX mismatch"
   | Some symbol, _, _ ->
     match String.Table.find dbs symbol with
     | None ->
       reject_historical_price_data_request
         ~reason_code:`hpdr_unable_to_serve_data_do_not_retry
-        w req "No such symbol" ;
-      raise Exit
+        w req "No such symbol"
     | Some db -> don't_wait_for begin
         In_thread.run begin fun () ->
           accept_historical_price_data_request w req db symbol span
