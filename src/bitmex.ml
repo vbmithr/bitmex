@@ -1159,25 +1159,25 @@ let reject_order (req : DTC.Submit_new_single_order.t) w k =
   end k
 
 let update_order (req : DTC.Submit_new_single_order.t) w ~status ~reason k =
-  let rej = DTC.default_order_update () in
-  rej.total_num_messages <- Some 1l ;
-  rej.message_number <- Some 1l ;
-  rej.trade_account <- req.trade_account ;
-  rej.order_status <- Some status ;
-  rej.order_update_reason <- Some reason ;
-  rej.client_order_id <- req.client_order_id ;
-  rej.order_type <- req.order_type ;
-  rej.buy_sell <- req.buy_sell ;
-  rej.open_or_close <- req.open_or_close ;
-  rej.price1 <- req.price1 ;
-  rej.price2 <- req.price2 ;
-  rej.order_quantity <- req.quantity ;
-  rej.time_in_force <- req.time_in_force ;
-  rej.good_till_date_time <- req.good_till_date_time ;
-  rej.free_form_text <- req.free_form_text ;
+  let u = DTC.default_order_update () in
+  u.total_num_messages <- Some 1l ;
+  u.message_number <- Some 1l ;
+  u.trade_account <- req.trade_account ;
+  u.order_status <- Some status ;
+  u.order_update_reason <- Some reason ;
+  u.client_order_id <- req.client_order_id ;
+  u.order_type <- req.order_type ;
+  u.buy_sell <- req.buy_sell ;
+  u.open_or_close <- req.open_or_close ;
+  u.price1 <- req.price1 ;
+  u.price2 <- req.price2 ;
+  u.order_quantity <- req.quantity ;
+  u.time_in_force <- req.time_in_force ;
+  u.good_till_date_time <- req.good_till_date_time ;
+  u.free_form_text <- req.free_form_text ;
   Printf.ksprintf begin fun info_text ->
-    rej.info_text <- Some info_text ;
-    write_message w `order_update DTC.gen_order_update rej ;
+    u.info_text <- Some info_text ;
+    write_message w `order_update DTC.gen_order_update u ;
   end k
 
 let submit_order w ~key ~secret (req : DTC.Submit_new_single_order.t) stop_exec_inst =
