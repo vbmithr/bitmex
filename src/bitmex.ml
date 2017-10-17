@@ -420,7 +420,7 @@ let fail_ordStatus_execType ~ordStatus ~execType =
     (ExecType.show execType)
     ()
 
-let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ~status ~reason w o =
+let write_order_update ?request_id ~nb_msgs ~msg_number ~status ~reason w o =
   let open RespObj in
   let cumQty = Option.map (int64 o "cumQty") ~f:Int64.to_float in
   let leavesQty = Option.map (int64 o "leavesQty") ~f:Int64.to_float in
@@ -488,7 +488,7 @@ let status_reason_of_execType_ordStatus e =
 let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ?status_reason w o =
   match status_reason with
   | Some (status, reason) ->
-      write_order_update ?request_id ~status ~reason w o
+      write_order_update ?request_id ~nb_msgs ~msg_number ~status ~reason w o
   | None ->
       match status_reason_of_execType_ordStatus o with
       | exception Exit -> ()
@@ -496,7 +496,7 @@ let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ?status_reason w
           Log.error log_bitmex "Not sending order update for %s" msg ;
           ()
       | status, reason ->
-          write_order_update ?request_id ~status ~reason w o
+          write_order_update ?request_id ~nb_msgs ~msg_number ~status ~reason w o
 
 let write_position_update ?request_id ~nb_msgs ~msg_number w p =
   let symbol = RespObj.string p "symbol" in
@@ -632,7 +632,7 @@ let process_execs { Connection.addr ; w ; key } execs =
         | Some Trade, Some Filled -> TradeHistory.set ~key e
         | _ -> ()
       end ;
-      write_order_update ~nb_msgs:1 ~msg_number:1 w e
+      write_order_update w e
     end ;
   Log.debug log_dtc "-> [%s] Sent Order Updates" addr
 
