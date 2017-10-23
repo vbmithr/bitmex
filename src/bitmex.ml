@@ -6,6 +6,7 @@ open Cohttp_async
 
 open Bs_devkit
 open Bmex
+open Bitmex_types
 
 module DTC = Dtc_pb.Dtcprotocol_piqi
 module WS = Bmex_ws
@@ -41,9 +42,9 @@ module Connection = struct
     mutable ws_uuid: Uuid.t;
     key: string;
     secret: string;
-    position: RespObj.t String.Table.t; (* indexed by symbol *)
-    margin: RespObj.t String.Table.t; (* indexed by currency *)
-    order: RespObj.t Uuid.Table.t; (* indexed by orderID *)
+    position: Position.t String.Table.t; (* indexed by symbol *)
+    margin: Margin.t String.Table.t; (* indexed by currency *)
+    order: Order.t Uuid.Table.t; (* indexed by orderID *)
     subs: int32 String.Table.t;
     rev_subs: string Int32.Table.t;
     subs_depth: int32 String.Table.t;
@@ -114,15 +115,15 @@ module Books = struct
     Option.value_map (String.Table.find asks symbol)
       ~default:Float.Map.empty ~f:mapify_ob
 
-  let update action { OrderBook.L2.symbol; id; side; size; price } =
+  let update action { OrderBookL2.symbol; id; side; size; price } =
     (* find_exn cannot raise here *)
     let bids = String.Table.find_or_add bids symbol ~default:Int.Table.create in
     let asks = String.Table.find_or_add asks symbol ~default:Int.Table.create in
     let table =
       match side with
-      | `buy -> bids
-      | `sell -> asks
-      | `buy_sell_unset -> failwith "update_depth: empty side" in
+      | "Buy" -> bids
+      | "Sell" -> asks
+      | _ -> failwith "update_depth: empty side" in
     let price =
       match price with
       | Some p -> Some p
@@ -154,9 +155,9 @@ module Books = struct
         | Delete -> `market_depth_delete_level in
       let side =
         match side with
-        | `buy -> Some `at_bid
-        | `sell -> Some `at_ask
-        | `buy_sell_unset -> None
+        | "Buy" -> Some `at_bid
+        | "Sell" -> Some `at_ask
+        | _ -> None
       in
       u.side <- side ;
       u.price <- Some price ;
@@ -175,24 +176,21 @@ module Books = struct
       Log.info log_bitmex "update_depth: received update before snapshot, ignoring"
 end
 
-module Instrument = struct
-  open RespObj
+module Instr = struct
   let is_index symbol = symbol.[0] = '.'
-  let to_secdef ~testnet t =
-    let symbol = string_exn t "symbol" in
-    let index = is_index symbol in
-    let exchange =
-      string_exn t "reference"
+
+  let to_secdef ~testnet (t : Instrument.t) =
+    let index = is_index t.symbol in
+    let exchange = (Option.value ~default:"" t.reference)
       ^ (if testnet && not index then "T" else "")
     in
-    let tickSize = float_exn t "tickSize" in
-    let expiration_date = Option.map (string t "expiry") ~f:(fun time ->
-        Time_ns.(of_string time |>
-                 to_int_ns_since_epoch |>
+    let tickSize = Option.value ~default:0. t.tickSize in
+    let expiration_date = Option.map t.expiry ~f:(fun time ->
+        Time_ns.(to_int_ns_since_epoch time |>
                  (fun t -> t / 1_000_000_000) |>
                  Int32.of_int_exn)) in
     let secdef = DTC.default_security_definition_response () in
-    secdef.symbol <- Some symbol ;
+    secdef.symbol <- Some t.symbol ;
     secdef.exchange <- Some exchange ;
     secdef.security_type <-
       Some (if index then `security_type_index else `security_type_future) ;
@@ -200,13 +198,13 @@ module Instrument = struct
     secdef.currency_value_per_increment <- Some tickSize ;
     secdef.price_display_format <- Some (price_display_format_of_ticksize tickSize) ;
     secdef.has_market_depth_data <- Some (not index) ;
-    secdef.underlying_symbol <- Some (string_exn t "underlyingSymbol") ;
+    secdef.underlying_symbol <- t.underlyingSymbol ;
     secdef.updates_bid_ask_only <- Some false ;
     secdef.security_expiration_date <- expiration_date ;
     secdef
 
   type t = {
-    mutable instrObj: RespObj.t;
+    mutable instr: Instrument.t;
     secdef: DTC.Security_definition_response.t ;
     mutable last_trade_price: float;
     mutable last_trade_size: int;
@@ -219,8 +217,8 @@ module Instrument = struct
       ?(last_trade_size = 0)
       ?(last_trade_ts = Time_ns.epoch)
       ?(last_quote_ts = Time_ns.epoch)
-      ~instrObj ~secdef () = {
-    instrObj ; secdef ;
+      ~instr ~secdef () = {
+    instr ; secdef ;
     last_trade_price ; last_trade_size ;
     last_trade_ts ; last_quote_ts
   }
@@ -236,19 +234,15 @@ module Instrument = struct
 
   let iter = String.Table.iter active
 
-  let delete instrObj =
-    let instrObj = RespObj.of_json instrObj in
-    let symbol = RespObj.(string_exn instrObj "symbol") in
-    remove symbol ;
-    Log.info log_bitmex "deleted instrument %s" symbol
+  let delete t =
+    remove t.Instrument.symbol ;
+    Log.info log_bitmex "deleted instrument %s" t.symbol
 
-  let insert instrObj =
-    let instrObj = RespObj.of_json instrObj in
-    let symbol = RespObj.string_exn instrObj "symbol" in
-    let secdef = to_secdef ~testnet:!use_testnet instrObj in
-    let instr = create ~instrObj ~secdef () in
-    set symbol instr;
-    Log.info log_bitmex "inserted instrument %s" symbol;
+  let insert t =
+    let secdef = to_secdef ~testnet:!use_testnet t in
+    let instr = create ~instr:t ~secdef () in
+    set t.symbol instr;
+    Log.info log_bitmex "inserted instrument %s" t.symbol;
     (* Send secdef response to connections. *)
     let on_connection { Connection.addr; w } =
       secdef.is_final_message <- Some true ;
@@ -257,37 +251,36 @@ module Instrument = struct
     in
     Connection.iter ~f:on_connection
 
-  let send_instr_update_msgs w instr symbol_id =
-    let open RespObj in
-    Option.iter (int64 instr "volume") ~f:begin fun volume ->
+  let send_instr_update_msgs w t symbol_id =
+    Option.iter t.Instrument.volume ~f:begin fun volume ->
       let msg = DTC.default_market_data_update_session_volume () in
       msg.symbol_id <- Some symbol_id ;
-      msg.volume <- Some Int64.(to_float volume) ;
+      msg.volume <- Some Int.(to_float volume) ;
       write_message w `market_data_update_session_volume
         DTC.gen_market_data_update_session_volume msg
     end ;
-    Option.iter (float instr "lowPrice") ~f:begin fun low ->
+    Option.iter t.lowPrice ~f:begin fun low ->
       let msg = DTC.default_market_data_update_session_low () in
       msg.symbol_id <- Some symbol_id ;
       msg.price <- Some low ;
       write_message w `market_data_update_session_low
         DTC.gen_market_data_update_session_low msg
     end ;
-    Option.iter (float instr "highPrice") ~f:begin fun high ->
+    Option.iter t.highPrice ~f:begin fun high ->
       let msg = DTC.default_market_data_update_session_high () in
       msg.symbol_id <- Some symbol_id ;
       msg.price <- Some high ;
       write_message w `market_data_update_session_high
         DTC.gen_market_data_update_session_high msg
     end ;
-    Option.iter (int64 instr "openInterest") ~f:begin fun open_interest ->
+    Option.iter t.openInterest ~f:begin fun open_interest ->
       let msg = DTC.default_market_data_update_open_interest () in
       msg.symbol_id <- Some symbol_id ;
-      msg.open_interest <- Some (Int64.to_int32_exn open_interest) ;
+      msg.open_interest <- Some (Int.to_int32_exn open_interest) ;
       write_message w `market_data_update_open_interest
         DTC.gen_market_data_update_open_interest msg
     end ;
-    Option.iter (float instr "prevClosePrice")~f:begin fun prev_close ->
+    Option.iter t.prevClosePrice ~f:begin fun prev_close ->
       let msg = DTC.default_market_data_update_session_open () in
       msg.symbol_id <- Some symbol_id ;
       msg.price <- Some prev_close ;
@@ -295,22 +288,20 @@ module Instrument = struct
         DTC.gen_market_data_update_session_open msg
     end
 
-  let update instrObj =
-    let instrObj = RespObj.of_json instrObj in
-    let symbol = RespObj.string_exn instrObj "symbol" in
-    match find symbol with
+  let update t =
+    match find t.Instrument.symbol with
     | None ->
-      Log.error log_bitmex "update_instr: unable to find %s" symbol;
+      Log.error log_bitmex "update_instr: unable to find %s" t.symbol;
     | Some instr ->
-      instr.instrObj <- RespObj.merge instr.instrObj instrObj;
-      Log.debug log_bitmex "updated instrument %s" symbol;
+      instr.instr <- Instrument.merge instr.instr t;
+      Log.debug log_bitmex "updated instrument %s" t.symbol;
       (* Send messages to subscribed clients according to the type of update. *)
       let on_connection { Connection.addr; w; subs } =
         let on_symbol_id symbol_id =
-          send_instr_update_msgs w instrObj symbol_id;
-          Log.debug log_dtc "-> [%s] instrument %s" addr symbol
+          send_instr_update_msgs w t symbol_id;
+          Log.debug log_dtc "-> [%s] instrument %s" addr t.symbol
         in
-        Option.iter String.Table.(find subs symbol) ~f:on_symbol_id
+        Option.iter String.Table.(find subs t.symbol) ~f:on_symbol_id
       in
       Connection.iter ~f:on_connection
 end
@@ -354,7 +345,7 @@ end
 
 module TradeHistory = struct
   let buf = Bi_outbuf.create 4096
-  let table : RespObj.t String.Map.t String.Table.t = String.Table.create ()
+  let table : Execution.t Uuid.Map.t String.Table.t = String.Table.create ()
 
   let get ~key ~secret =
     let filter = `Assoc ["execType", `String "Trade"] in
@@ -364,21 +355,20 @@ module TradeHistory = struct
     | Error err ->
       Log.error log_bitmex "%s" (Error.to_string_hum err) ;
       Error err
-    | Ok (resp, trades) ->
+    | Ok (resp, execs) ->
       let trades =
-        List.fold_left trades ~init:String.Map.empty ~f:begin fun a trade ->
-          let trade = RespObj.of_json trade in
-          let orderID = RespObj.string_exn trade "orderID" in
-          String.Map.add a orderID trade
+        List.fold_left execs ~init:Uuid.Map.empty ~f:begin fun a e ->
+          match e.orderID with
+          | None -> a
+          | Some orderID -> Uuid.Map.add a orderID e
         end in
       String.Table.set table key trades ;
       Ok trades
 
   let filter_trades min_ts trades =
-    String.Map.filter trades ~f:begin fun t ->
+    Uuid.Map.filter trades ~f:begin fun t ->
       let ts =
-        Option.value_map (RespObj.string t "transactTime")
-          ~default:Time_ns.max_value ~f:Time_ns.of_string in
+        Option.value t.Execution.transactTime ~default:Time_ns.max_value in
       Time_ns.(ts > min_ts)
     end
 
@@ -392,15 +382,17 @@ module TradeHistory = struct
   let get_one ~key ~orderID =
     let open Option in
     String.Table.find table key >>= fun trades ->
-    String.Map.find trades orderID
+    Uuid.Map.find trades orderID
 
   let set ~key trade =
-    let orderID = RespObj.string_exn trade "orderID" in
-    let data = Option.value_map
-      (String.Table.find table key)
-      ~default:(String.Map.singleton orderID trade)
-      ~f:(String.Map.add ~key:orderID ~data:trade) in
-    String.Table.set table ~key ~data
+    match trade.Execution.orderID with
+    | None -> invalid_arg "TradeHistory.set"
+    | Some orderID ->
+        let data = Option.value_map
+            (String.Table.find table key)
+            ~default:(Uuid.Map.singleton orderID trade)
+            ~f:(Uuid.Map.add ~key:orderID ~data:trade) in
+        String.Table.set table ~key ~data
 end
 
 let send_heartbeat { Connection.addr ; w } span =
@@ -420,29 +412,30 @@ let fail_ordStatus_execType ~ordStatus ~execType =
     (ExecType.show execType)
     ()
 
-let write_order_update ?request_id ~nb_msgs ~msg_number ~status ~reason w o =
-  let open RespObj in
-  let cumQty = Option.map (int64 o "cumQty") ~f:Int64.to_float in
-  let leavesQty = Option.map (int64 o "leavesQty") ~f:Int64.to_float in
+let fail_ordStatus ordStatus =
+  invalid_argf "Wrong ordStatus: %s" (OrdStatus.show ordStatus) ()
+
+let write_exec_update ?request_id ~nb_msgs ~msg_number ~status ~reason w (e : Execution.t) =
+  let cumQty = Option.map e.cumQty ~f:Int.to_float in
+  let leavesQty = Option.map e.leavesQty ~f:Int.to_float in
   let orderQty = Option.map2 cumQty leavesQty ~f:Float.add in
   let u = DTC.default_order_update () in
-  let price = float_or_null_exn ~default:Float.max_finite_value o "price" in
-  let stopPx = float_or_null_exn ~default:Float.max_finite_value o "stopPx" in
-  let side = Option.map (string o "side") ~f:Side.of_string in
-  let ordType = Option.map (string o "ordType") ~f:OrderType.of_string in
-  let timeInForce = Option.map (string o "timeInForce")~f:TimeInForce.of_string in
-  let ts = Option.map (string o "transactTime")
-      ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) in
+  let price = Option.value ~default:Float.max_finite_value e.price in
+  let stopPx = Option.value ~default:Float.max_finite_value e.stopPx in
+  let side = Option.map e.side ~f:Side.of_string in
+  let ordType = Option.map e.ordType ~f:OrderType.of_string in
+  let timeInForce = Option.map e.timeInForce ~f:TimeInForce.of_string in
+  let ts = Option.map e.transactTime ~f:seconds_int64_of_ts in
   let p1, p2 = OrderType.to_p1_p2 ~stopPx ~price
       (Option.value ~default:`order_type_unset ordType) in
   u.request_id <- request_id ;
   u.total_num_messages <- Some (Int32.of_int_exn nb_msgs) ;
   u.message_number <- Some (Int32.of_int_exn msg_number) ;
-  u.symbol <- (string o "symbol") ;
+  u.symbol <- e.symbol ;
   u.exchange <- Some !my_exchange ;
-  u.client_order_id <- string o "clOrdID" ;
-  u.server_order_id <- string o "orderID" ;
-  u.exchange_order_id <- string o "orderID" ;
+  u.client_order_id <- e.clOrdID ;
+  u.server_order_id <- Option.map ~f:Uuid.to_string e.orderID ;
+  u.exchange_order_id <- Option.map ~f:Uuid.to_string e.orderID ;
   u.order_type <- ordType ;
   u.order_status <- Some status ;
   u.order_update_reason <- Some reason ;
@@ -453,22 +446,58 @@ let write_order_update ?request_id ~nb_msgs ~msg_number ~status ~reason w o =
   u.order_quantity <- orderQty ;
   u.filled_quantity <- cumQty ;
   u.remaining_quantity <- leavesQty ;
-  u.average_fill_price <- (float o "avgPx") ;
-  u.last_fill_price <- (float o "lastPx") ;
+  u.average_fill_price <- e.avgPx ;
+  u.last_fill_price <- e.lastPx ;
   u.last_fill_date_time <- ts ;
-  u.last_fill_quantity <- Option.map ~f:Int64.to_float (int64 o "lastQty") ;
-  u.last_fill_execution_id <- string o "execID" ;
-  u.trade_account <- Option.map ~f:Int64.to_string (int64 o "account") ;
-  u.info_text <- string o "ordRejReason" ;
-  u.free_form_text <- string o "text" ;
+  u.last_fill_quantity <- Option.map ~f:Int.to_float e.lastQty ;
+  u.last_fill_execution_id <- Some (Uuid.to_string e.execID) ;
+  u.trade_account <- Option.map ~f:Int.to_string e.account ;
+  u.info_text <- e.ordRejReason ;
+  u.free_form_text <- e.text ;
   write_message w `order_update DTC.gen_order_update u
 
-let status_reason_of_execType_ordStatus e =
-  let ordStatus = RespObj.(string_exn e "ordStatus") |> OrdStatus.of_string in
-  let execType = RespObj.(string_exn e "execType") |> ExecType.of_string in
+let write_order_update ?request_id ~nb_msgs ~msg_number ~status ~reason w (e : Order.t) =
+  let cumQty = Option.map e.cumQty ~f:Int.to_float in
+  let leavesQty = Option.map e.leavesQty ~f:Int.to_float in
+  let orderQty = Option.map2 cumQty leavesQty ~f:Float.add in
+  let u = DTC.default_order_update () in
+  let price = Option.value ~default:Float.max_finite_value e.price in
+  let stopPx = Option.value ~default:Float.max_finite_value e.stopPx in
+  let side = Option.map e.side ~f:Side.of_string in
+  let ordType = Option.map e.ordType ~f:OrderType.of_string in
+  let timeInForce = Option.map e.timeInForce ~f:TimeInForce.of_string in
+  let ts = Option.map e.transactTime ~f:seconds_int64_of_ts in
+  let p1, p2 = OrderType.to_p1_p2 ~stopPx ~price
+      (Option.value ~default:`order_type_unset ordType) in
+  u.request_id <- request_id ;
+  u.total_num_messages <- Some (Int32.of_int_exn nb_msgs) ;
+  u.message_number <- Some (Int32.of_int_exn msg_number) ;
+  u.symbol <- e.symbol ;
+  u.exchange <- Some !my_exchange ;
+  u.client_order_id <- e.clOrdID ;
+  u.server_order_id <- Some (Uuid.to_string e.orderID) ;
+  u.exchange_order_id <- Some (Uuid.to_string e.orderID) ;
+  u.order_type <- ordType ;
+  u.order_status <- Some status ;
+  u.order_update_reason <- Some reason ;
+  u.buy_sell <- side ;
+  u.price1 <- p1 ;
+  u.price2 <- p2 ;
+  u.time_in_force <- timeInForce ;
+  u.order_quantity <- orderQty ;
+  u.filled_quantity <- cumQty ;
+  u.remaining_quantity <- leavesQty ;
+  u.average_fill_price <- e.avgPx ;
+  u.last_fill_date_time <- ts ;
+  u.trade_account <- Option.map ~f:Int.to_string e.account ;
+  u.info_text <- e.ordRejReason ;
+  u.free_form_text <- e.text ;
+  write_message w `order_update DTC.gen_order_update u
+
+let status_reason_of_execType_ordStatus execType ordStatus =
   match ordStatus, execType with
 
-  | New, New
+  | OrdStatus.New, ExecType.New
   | New, TriggeredOrActivatedBySystem -> `order_status_open, `new_order_accepted
   | New, Replaced -> `order_status_open, `order_cancel_replace_complete
   | New, Restated -> `order_status_open, `general_order_update
@@ -485,12 +514,39 @@ let status_reason_of_execType_ordStatus e =
   | _, Settlement -> raise Exit
   | _ -> fail_ordStatus_execType ~ordStatus ~execType
 
+let status_reason_of_ordStatus = function
+  | OrdStatus.New -> `order_status_open, `new_order_accepted
+  | PartiallyFilled -> `order_status_partially_filled, `order_filled_partially
+  | Filled -> `order_status_filled, `order_filled
+  | Canceled -> `order_status_canceled, `order_canceled
+  | Rejected -> `order_status_rejected, `new_order_rejected
+  | ordStatus -> fail_ordStatus ordStatus
+
+let write_exec_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ?status_reason w e =
+  match status_reason with
+  | Some (status, reason) ->
+      write_exec_update ?request_id ~nb_msgs ~msg_number ~status ~reason w e
+  | None ->
+      let ordStatus =
+        Option.value_map e.ordStatus ~default:(OrdStatus.Unknown "") ~f:OrdStatus.of_string in
+      let execType =
+        Option.value_map e.execType ~default:(ExecType.Unknown "") ~f:ExecType.of_string in
+      match status_reason_of_execType_ordStatus execType ordStatus with
+      | exception Exit -> ()
+      | exception Invalid_argument msg ->
+          Log.error log_bitmex "Not sending order update for %s" msg ;
+          ()
+      | status, reason ->
+          write_exec_update ?request_id ~nb_msgs ~msg_number ~status ~reason w e
+
 let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ?status_reason w o =
   match status_reason with
   | Some (status, reason) ->
       write_order_update ?request_id ~nb_msgs ~msg_number ~status ~reason w o
   | None ->
-      match status_reason_of_execType_ordStatus o with
+      let ordStatus =
+        Option.value_map o.ordStatus ~default:(OrdStatus.Unknown "") ~f:OrdStatus.of_string in
+      match status_reason_of_ordStatus ordStatus with
       | exception Exit -> ()
       | exception Invalid_argument msg ->
           Log.error log_bitmex "Not sending order update for %s" msg ;
@@ -498,40 +554,36 @@ let write_order_update ?request_id ?(nb_msgs=1) ?(msg_number=1) ?status_reason w
       | status, reason ->
           write_order_update ?request_id ~nb_msgs ~msg_number ~status ~reason w o
 
-let write_position_update ?request_id ~nb_msgs ~msg_number w p =
-  let symbol = RespObj.string p "symbol" in
-  let trade_account = RespObj.int p "account" in
-  let avgEntryPrice = RespObj.float p "avgEntryPrice" in
-  let currentQty = RespObj.int p "currentQty" in
+let write_position_update ?request_id ~nb_msgs ~msg_number w (p : Position.t) =
   let u = DTC.default_position_update () in
   u.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
   u.message_number <- Some (Int32.of_int_exn msg_number) ;
   u.request_id <- request_id ;
-  u.symbol <- symbol ;
+  u.symbol <- Some p.symbol ;
   u.exchange <- Some !my_exchange ;
-  u.trade_account <- Option.map trade_account ~f:Int.to_string ;
-  u.average_price <- avgEntryPrice ;
-  u.quantity <- Option.map currentQty ~f:Int.to_float ;
+  u.trade_account <- Some (Int.to_string p.account) ;
+  u.average_price <- p.avgEntryPrice ;
+  u.quantity <- Option.map p.currentQty ~f:Int.to_float ;
   write_message w `position_update DTC.gen_position_update u
 
-let write_balance_update ?request_id ~msg_number ~nb_msgs w m =
-  let open RespObj in
+let write_balance_update ?request_id ~msg_number ~nb_msgs w (m : Margin.t) =
+  let margin_req = match m.initMargin, m.maintMargin, m.sessionMargin with
+    | Some a, Some b, Some c -> Some ((a+b+c) // 100000)
+    | _ -> None in
   let u = DTC.default_account_balance_update () in
   u.request_id <- request_id ;
   u.unsolicited <- Some (Option.is_none request_id) ;
   u.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
   u.message_number <- Some (Int32.of_int_exn msg_number) ;
   u.account_currency <- Some "mXBT" ;
-  u.cash_balance <- Some (Int64.(to_float @@ int64_exn m "walletBalance") /. 1e5) ;
+  u.cash_balance <-
+    Option.map m.walletBalance ~f:(fun b -> Int.to_float b /. 1e5) ;
   u.balance_available_for_new_positions <-
-    Some (Int64.(to_float @@ int64_exn m "availableMargin") /. 1e5) ;
+    Option.map m.availableMargin ~f:(fun b -> Int.to_float b /. 1e5) ;
   u.securities_value <-
-    Some (Int64.(to_float @@ int64_exn m "marginBalance") /. 1e5) ;
-  u.margin_requirement <- (Int64.(
-      Some (to_float (int64_exn m "initMargin" +
-                      int64_exn m "maintMargin" +
-                      int64_exn m "sessionMargin") /. 1e5))) ;
-  u.trade_account <- Option.map (int64 m "account") ~f:Int64.to_string ;
+    Option.map m.marginBalance ~f:(fun b -> Int.to_float b /. 1e5) ;
+  u.margin_requirement <- margin_req ;
+  u.trade_account <- Some (Int.to_string m.account) ;
   write_message w `account_balance_update DTC.gen_account_balance_update u
 
 type subscribe_msg =
@@ -541,50 +593,45 @@ type subscribe_msg =
 let client_ws_r, client_ws_w = Pipe.create ()
 
 let process_orders { Connection.addr ; order } partial_iv action orders =
-  let orders = List.map orders ~f:RespObj.of_json in
   List.iter orders ~f:begin fun o ->
-    let oid = RespObj.string_exn o "orderID" in
-    let oid = Uuid.of_string oid in
     match action with
     | WS.Response.Update.Delete ->
-      Uuid.Table.remove order oid;
+      Uuid.Table.remove order o.Order.orderID;
       Log.debug log_bitmex "<- [%s] order delete" addr
     | Insert
     | Partial ->
-      Uuid.Table.set order ~key:oid ~data:o;
+      Uuid.Table.set order ~key:o.orderID ~data:o;
       Log.debug log_bitmex "<- [%s] order insert/partial" addr
     | Update ->
       if Ivar.is_full partial_iv then begin
-        let data = match Uuid.Table.find order oid with
+        let data = match Uuid.Table.find order o.orderID with
           | None -> o
-          | Some old_o -> RespObj.merge old_o o
+          | Some old_o -> Order.merge old_o o
         in
-        Uuid.Table.set order ~key:oid ~data;
+        Uuid.Table.set order ~key:o.orderID ~data;
         Log.debug log_bitmex "<- [%s] order update" addr
       end
   end;
   if action = Partial then Ivar.fill_if_empty partial_iv ()
 
 let process_margins { Connection.addr ; w ; margin } partial_iv action margins =
-  let margins = List.map margins ~f:RespObj.of_json in
   List.iteri margins ~f:begin fun i m ->
-    let currency = RespObj.string_exn m "currency" in
     match action with
     | WS.Response.Update.Delete ->
-      String.Table.remove margin currency ;
+      String.Table.remove margin m.Margin.currency ;
       Log.debug log_bitmex "<- [%s] margin delete" addr
     | Insert
     | Partial ->
-      String.Table.set margin ~key:currency ~data:m;
+      String.Table.set margin ~key:m.currency ~data:m;
       Log.debug log_bitmex "<- [%s] margin insert/partial" addr;
       write_balance_update ~msg_number:1 ~nb_msgs:1 w m
     | Update ->
       if Ivar.is_full partial_iv then begin
-        let m = match String.Table.find margin currency with
+        let m = match String.Table.find margin m.currency with
           | None -> m
-          | Some old_m -> RespObj.merge old_m m
+          | Some old_m -> Margin.merge old_m m
         in
-        String.Table.set margin ~key:currency ~data:m;
+        String.Table.set margin ~key:m.currency ~data:m;
         write_balance_update ~msg_number:1 ~nb_msgs:1 w m ;
         Log.debug log_bitmex "<- [%s] margin update" addr
       end
@@ -592,30 +639,28 @@ let process_margins { Connection.addr ; w ; margin } partial_iv action margins =
   if action = Partial then Ivar.fill_if_empty partial_iv ()
 
 let process_positions { Connection.addr ; w ; position } partial_iv action positions =
-  let positions = List.map positions ~f:RespObj.of_json in
   List.iter positions ~f:begin fun p ->
-    let symbol = RespObj.string_exn p "symbol" in
     match action with
     | WS.Response.Update.Delete ->
-      String.Table.remove position symbol ;
+      String.Table.remove position p.Position.symbol ;
       Log.debug log_bitmex "<- [%s] position delete" addr
     | Insert | Partial ->
-      String.Table.set position ~key:symbol ~data:p;
-      if RespObj.bool_exn p "isOpen" then begin
+      String.Table.set position ~key:p.symbol ~data:p;
+      if Option.value ~default:false p.isOpen then begin
         write_position_update ~nb_msgs:1 ~msg_number:1 w p ;
         Log.debug log_bitmex "<- [%s] position insert/partial" addr
       end
     | Update ->
       if Ivar.is_full partial_iv then begin
-        let old_p, p = match String.Table.find position symbol with
+        let old_p, p = match String.Table.find position p.symbol with
           | None -> None, p
-          | Some old_p -> Some old_p, RespObj.merge old_p p
+          | Some old_p -> Some old_p, Position.merge old_p p
         in
-        String.Table.set position ~key:symbol ~data:p;
+        String.Table.set position ~key:p.symbol ~data:p;
         match old_p with
-        | Some old_p when RespObj.bool_exn old_p "isOpen" ->
+        | Some old_p when Option.value ~default:false old_p.isOpen ->
           write_position_update ~nb_msgs:1 ~msg_number:1 w p ;
-          Log.debug log_dtc "<- [%s] position update %s" addr symbol
+          Log.debug log_dtc "<- [%s] position update %s" addr p.symbol
         | _ -> ()
       end
   end;
@@ -623,16 +668,14 @@ let process_positions { Connection.addr ; w ; position } partial_iv action posit
 
 let process_execs { Connection.addr ; w ; key } execs =
   List.iter execs ~f:begin fun e ->
-      let e = RespObj.of_json e in
-      let symbol = RespObj.string_exn e "symbol" in
-      let execType = Option.map (RespObj.string e "execType") ~f:ExecType.of_string in
-      let ordStatus = Option.map (RespObj.string e "ordStatus") ~f:OrdStatus.of_string in
-      Log.debug log_bitmex "<- [%s] exec %s" addr symbol;
+      let execType = Option.map e.Execution.execType ~f:ExecType.of_string in
+      let ordStatus = Option.map e.ordStatus ~f:OrdStatus.of_string in
+      Option.iter e.symbol ~f:(fun s -> Log.debug log_bitmex "<- [%s] exec %s" addr s) ;
       begin match execType, ordStatus with
         | Some Trade, Some Filled -> TradeHistory.set ~key e
         | _ -> ()
       end ;
-      write_order_update w e
+      write_exec_update w e
     end ;
   Log.debug log_dtc "-> [%s] Sent Order Updates" addr
 
@@ -643,11 +686,16 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position;
 
   let on_update { WS.Response.Update.table; action; data } =
     match table, action, data with
-      | Order, action, orders -> process_orders c order_iv action orders
-      | Margin, action, margins -> process_margins c margin_iv action margins
-      | Position, action, positions -> process_positions c position_iv action positions
-      | Execution, action, execs -> process_execs c execs
-      | table, _, _ -> Log.error log_bitmex "Unknown table %s" (Bmex_ws.Topic.to_string table)
+    | Order, action, orders ->
+        process_orders c order_iv action (List.map ~f:Order.of_yojson orders)
+    | Margin, action, margins ->
+        process_margins c margin_iv action (List.map ~f:Margin.of_yojson margins)
+    | Position, action, positions ->
+        process_positions c position_iv action (List.map ~f:Position.of_yojson positions)
+    | Execution, action, execs ->
+        process_execs c (List.map ~f:Execution.of_yojson execs)
+    | table, _, _ ->
+        Log.error log_bitmex "Unknown table %s" (Bmex_ws.Topic.to_string table)
   in
   Pipe.write client_ws_w @@ Subscribe c >>= fun () ->
   don't_wait_for @@ Monitor.handle_errors
@@ -691,13 +739,13 @@ let accept_logon_request addr w req client stop_exec_inst trading =
   write_message w `logon_response DTC.gen_logon_response r ;
 
   Log.debug log_dtc "-> [%s] Logon Response" addr ;
-  let on_instrument { Instrument.secdef } =
+  let on_instrument { Instr.secdef } =
     secdef.request_id <- Some 0l ;
     secdef.is_final_message <- Some true ;
     write_message w `security_definition_response
       DTC.gen_security_definition_response secdef
   in
-  Instrument.iter ~f:on_instrument
+  Instr.iter ~f:on_instrument
 
 let setup_client_ws conn apikey =
   let ws_initialized = client_ws conn in
@@ -755,10 +803,10 @@ let security_definition_request addr w msg =
   match req.request_id, req.symbol, req.exchange with
   | Some id, Some symbol, Some exchange ->
     Log.debug log_dtc "<- [%s] Security Definition Request %s %s" addr symbol exchange;
-    if !my_exchange <> exchange && not Instrument.(is_index symbol) then
+    if !my_exchange <> exchange && not Instr.(is_index symbol) then
       security_definition_reject addr w id "No such symbol %s %s" symbol exchange
     else begin
-      match Instrument.find symbol with
+      match Instr.find symbol with
       | None ->
         security_definition_reject addr w id "No such symbol %s %s" symbol exchange
       | Some { secdef } ->
@@ -782,17 +830,14 @@ let reject_market_data_request ?id addr w k =
   end k
 
 let write_market_data_snapshot ?id addr w symbol
-    { Instrument.instrObj; last_trade_price;
+    { Instr.instr; last_trade_price;
       last_trade_size; last_trade_ts; last_quote_ts } =
-  let open RespObj in
-  if Instrument.is_index symbol then begin
+  if Instr.is_index symbol then begin
     let snap = DTC.default_market_data_snapshot () in
     snap.symbol_id <- id ;
-    snap.session_settlement_price <- float instrObj "prevPrice24h" ;
-    snap.last_trade_price <- float instrObj "lastPrice" ;
-    snap.last_trade_date_time <-
-      string instrObj "timestamp" |>
-      Option.map ~f:(Fn.compose float_of_ts Time_ns.of_string) ;
+    snap.session_settlement_price <- instr.prevPrice24h ;
+    snap.last_trade_price <- instr.lastPrice ;
+    snap.last_trade_date_time <- Option.map instr.timestamp ~f:float_of_ts ;
     write_message w `market_data_snapshot DTC.gen_market_data_snapshot snap
   end
   else begin
@@ -800,15 +845,15 @@ let write_market_data_snapshot ?id addr w symbol
     let open Option in
     let snap = DTC.default_market_data_snapshot () in
     snap.session_settlement_price <-
-      Some (value ~default:Float.max_finite_value (float instrObj "indicativeSettlePrice")) ;
+      Some (value ~default:Float.max_finite_value instr.indicativeSettlePrice) ;
     snap.session_high_price <-
-      Some (value ~default:Float.max_finite_value @@ float instrObj "highPrice") ;
+      Some (value ~default:Float.max_finite_value instr.highPrice) ;
     snap.session_low_price <-
-      Some (value ~default:Float.max_finite_value @@ float instrObj "lowPrice") ;
+      Some (value ~default:Float.max_finite_value instr.lowPrice) ;
     snap.session_volume <-
-      Some (value_map (int64 instrObj "volume") ~default:Float.max_finite_value ~f:Int64.to_float) ;
+      Some (value_map instr.volume ~default:Float.max_finite_value ~f:Int.to_float) ;
     snap.open_interest <-
-      Some (value_map (int64 instrObj "openInterest") ~default:0xffffffffl ~f:Int64.to_int32_exn) ;
+      Some (value_map instr.openInterest ~default:0xffffffffl ~f:Int.to_int32_exn) ;
     snap.bid_price <- bidPrice ;
     snap.bid_quantity <- Option.(map bidSize ~f:Float.of_int) ;
     snap.ask_price <- askPrice ;
@@ -829,9 +874,9 @@ let market_data_request addr w msg =
         req.exchange
   with
   | _, id, Some symbol, Some exchange
-    when exchange <> !my_exchange && Instrument.(is_index symbol) ->
+    when exchange <> !my_exchange && Instr.(is_index symbol) ->
     reject_market_data_request ?id addr w "No such exchange %s" exchange
-  | _, id, Some symbol, _ when not (Instrument.mem symbol) ->
+  | _, id, Some symbol, _ when not (Instr.mem symbol) ->
     reject_market_data_request ?id addr w "No such symbol %s" symbol
   | Some `unsubscribe, Some id, _, _ ->
     begin match Int32.Table.find rev_subs id with
@@ -842,7 +887,7 @@ let market_data_request addr w msg =
   | Some `snapshot, id, Some symbol, Some exchange ->
     Log.debug log_dtc "<- [%s] Market Data Request (snapshot) %s %s"
       addr symbol exchange ;
-    let instr = Instrument.find_exn symbol in
+    let instr = Instr.find_exn symbol in
     write_market_data_snapshot ?id addr w symbol instr ;
     Log.debug log_dtc "-> [%s] Market Data Snapshot %s %s" addr symbol exchange
   | Some `subscribe, Some id, Some symbol, Some exchange ->
@@ -857,7 +902,7 @@ let market_data_request addr w msg =
       | _ ->
         String.Table.set subs symbol id ;
         Int32.Table.set rev_subs id symbol ;
-        let instr = Instrument.find_exn symbol in
+        let instr = Instr.find_exn symbol in
         write_market_data_snapshot ~id addr w symbol instr ;
         Log.debug log_dtc "-> [%s] Market Data Snapshot %s %s" addr symbol exchange
     end
@@ -916,7 +961,7 @@ let market_depth_request addr w msg =
   with
   | _, id, _, Some exchange when exchange <> !my_exchange ->
     reject_market_depth_request ?id addr w "No such exchange %s" exchange
-  | _, id, Some symbol, _ when not (Instrument.mem symbol) ->
+  | _, id, Some symbol, _ when not (Instr.mem symbol) ->
     reject_market_data_request ?id addr w "No such symbol %s" symbol
   | Some `unsubscribe, Some id, _, _ ->
     begin match Int32.Table.find rev_subs_depth id with
@@ -959,11 +1004,10 @@ let open_orders_request addr w msg =
   Log.debug log_dtc "<- [%s] Open Orders Request" addr ;
   let nb_msgs, open_orders =
     Uuid.Table.fold order  ~init:(0, []) ~f:begin fun ~key:_ ~data ((nb_open_orders, os) as acc) ->
-      let ordStatus = RespObj.(string_exn data "ordStatus") |> OrdStatus.of_string in
-      match ordStatus with
-      | New -> (succ nb_open_orders, (`order_status_open, data) :: os)
-      | PartiallyFilled -> (succ nb_open_orders, (`order_status_partially_filled, data) :: os)
-      | PendingCancel -> (succ nb_open_orders, (`order_status_pending_cancel, data) :: os)
+      match Option.map ~f:OrdStatus.of_string data.Order.ordStatus with
+      | Some New -> (succ nb_open_orders, (`order_status_open, data) :: os)
+      | Some PartiallyFilled -> (succ nb_open_orders, (`order_status_partially_filled, data) :: os)
+      | Some PendingCancel -> (succ nb_open_orders, (`order_status_pending_cancel, data) :: os)
       | _ -> acc
     end
   in
@@ -990,7 +1034,8 @@ let current_positions_request addr w msg =
   Log.debug log_dtc "<- [%s] Current Positions Request" addr ;
   let nb_msgs, open_positions = String.Table.fold position ~init:(0, [])
       ~f:begin fun ~key:_ ~data ((nb_open_ps, open_ps) as acc) ->
-        if RespObj.bool_exn data "isOpen" then succ nb_open_ps, data :: open_ps
+        if Option.value ~default:false data.Position.isOpen then
+          succ nb_open_ps, data :: open_ps
         else acc
       end
   in
@@ -1003,34 +1048,29 @@ let current_positions_request addr w msg =
   if nb_msgs = 0 then write_no_positions req w ;
   Log.debug log_dtc "-> [%s] Current Position Response (%d positions)" addr nb_msgs
 
-let send_historical_order_fills_response req addr w trades =
-  let open RespObj in
+let send_historical_order_fills_response req addr w execs =
   let resp = DTC.default_historical_order_fill_response () in
-  let nb_msgs = String.Map.length trades in
+  let nb_msgs = Uuid.Map.length execs in
   resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
   resp.request_id <- req.DTC.Historical_order_fills_request.request_id ;
   resp.trade_account <- req.trade_account ;
-  let _ = String.Map.fold trades ~init:1l ~f:begin fun ~key:_ ~data:t message_number ->
-    let cumQty = int64 t "cumQty" in
-    let leavesQty = int64 t "leavesQty" in
-    let orderQty =
-      Option.map2 cumQty leavesQty ~f:Int64.(fun a b -> to_float (a + b)) in
-    let side = string_exn t "side" |> Side.of_string in
-    resp.message_number <- Some message_number ;
-    resp.symbol <- Some (string_exn t "symbol") ;
-    resp.exchange <- Some !my_exchange ;
-    resp.server_order_id <- Some (string_exn t "orderID") ;
-    resp.price <- Some (float_exn t "avgPx") ;
-    resp.quantity <- orderQty ;
-    resp.date_time <-
-      string t "transactTime" |>
-      Option.map ~f:(Fn.compose seconds_int64_of_ts Time_ns.of_string) ;
-    resp.buy_sell <- Some side ;
-    resp.unique_execution_id <- Some (string_exn t "execID") ;
-    write_message w `historical_order_fill_response
-      DTC.gen_historical_order_fill_response resp ;
-    Int32.succ message_number
-  end in
+  let _ = Uuid.Map.fold execs ~init:1l ~f:begin fun ~key:_ ~data:t message_number ->
+      let orderQty =
+        Option.map2 t.Execution.cumQty t.leavesQty ~f:(fun a b -> Int.to_float (a + b)) in
+      let side = Option.value_map ~default:`buy_sell_unset t.side ~f:Side.of_string in
+      resp.message_number <- Some message_number ;
+      resp.symbol <- t.symbol ;
+      resp.exchange <- Some !my_exchange ;
+      resp.server_order_id <- Option.map ~f:Uuid.to_string t.orderID ;
+      resp.price <- t.avgPx ;
+      resp.quantity <- orderQty ;
+      resp.date_time <- Option.map t.transactTime ~f:seconds_int64_of_ts ;
+      resp.buy_sell <- Some side ;
+      resp.unique_execution_id <- Some (Uuid.to_string t.execID) ;
+      write_message w `historical_order_fill_response
+        DTC.gen_historical_order_fill_response resp ;
+      Int32.succ message_number
+    end in
   Log.debug log_dtc "-> [%s] Historical Order Fills Response (%d fills)" addr nb_msgs
 
 let reject_historical_order_fills_request ?request_id w k =
@@ -1064,7 +1104,7 @@ let historical_order_fills_request addr w msg =
     Log.debug log_dtc "<- [%s] Historical Order Fills Request" addr ;
     don't_wait_for begin
       TradeHistory.get ?min_ts ~key ~secret >>| function
-      | Ok trades when String.Map.is_empty trades ->
+      | Ok trades when Uuid.Map.is_empty trades ->
         write_no_historical_order_fills req w ;
         Log.debug log_dtc "-> [%s] No Order Fills" addr ;
       | Ok trades ->
@@ -1074,15 +1114,16 @@ let historical_order_fills_request addr w msg =
         reject_historical_order_fills_request ?request_id:req.request_id w
           "Error fetching historical order fills from BitMEX"
     end
-  | orderID -> begin
-      Log.debug log_dtc "<- [%s] Historical Order Fills Request for %s" addr orderID ;
+  | orderID_str -> begin
+      let orderID = Uuid.of_string orderID_str in
+      Log.debug log_dtc "<- [%s] Historical Order Fills Request for %s" addr orderID_str ;
       match TradeHistory.get_one ~key ~orderID with
       | None ->
         write_no_historical_order_fills req w ;
         Log.debug log_dtc "-> [%s] No Order Fills" addr ;
       | Some trade ->
         send_historical_order_fills_response req addr w
-          (String.Map.singleton orderID trade)
+          (Uuid.Map.singleton orderID trade)
     end
 
 let trade_accounts_request addr w msg =
@@ -1090,14 +1131,13 @@ let trade_accounts_request addr w msg =
   let { Connection.margin } = Connection.find_exn addr in
   Log.debug log_dtc "<- [%s] Trade Accounts Request" addr ;
   let margin = List.hd_exn (String.Table.data margin) in
-  let account = RespObj.int_exn margin "account" in
   let resp = DTC.default_trade_account_response () in
   resp.request_id <- req.request_id ;
   resp.total_number_messages <- Some 1l ;
   resp.message_number <- Some 1l ;
-  resp.trade_account <- Some Int.(to_string account) ;
+  resp.trade_account <- Some Int.(to_string margin.Margin.account) ;
   write_message w `trade_account_response  DTC.gen_trade_account_response resp ;
-  Log.debug log_dtc "-> [%s] Trade Account Response (%d)" addr account
+  Log.debug log_dtc "-> [%s] Trade Account Response (%d)" addr margin.account
 
 let reject_account_balance_request ?request_id addr w k =
   let rej = DTC.default_account_balance_reject () in
@@ -1269,8 +1309,7 @@ let amend_order addr w req key secret orderID ordType =
     ?stopPx
     ~orderID () in
   REST.Order.amend_bulk ~log:log_bitmex ~testnet:!use_testnet ~key ~secret [amend] >>| function
-  | Ok (_resp, body) ->
-    Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body
+  | Ok (_resp, body) -> ()
   | Error err ->
     let err_str = Error.to_string_hum err in
     reject_cancel_replace_order req addr w "%s" err_str;
@@ -1296,9 +1335,9 @@ let cancel_replace_order addr w msg =
       reject_cancel_replace_order req addr w
         "Cancel Replace Order: Order Not Found"
     | Some o ->
-      let orderID = RespObj.string_exn o "orderID" |> Uuid.of_string in
-      let ordType = RespObj.string_exn o "ordType" |> OrderType.of_string in
-      don't_wait_for (amend_order addr w req key secret orderID ordType)
+        let ordType =
+          Option.value_map ~default:`order_type_unset o.ordType ~f:OrderType.of_string in
+        don't_wait_for (amend_order addr w req key secret o.orderID ordType)
 
 let reject_cancel_order (req : DTC.Cancel_order.t) addr w k =
   let rej = DTC.default_order_update () in
@@ -1316,8 +1355,7 @@ let reject_cancel_order (req : DTC.Cancel_order.t) addr w k =
 let cancel_solo_order req addr w key secret orderID =
   REST.Order.cancel
     ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~orderIDs:[orderID] () >>| function
-  | Ok (_resp, body) ->
-    Log.debug log_bitmex "<- %s" @@ Yojson.Safe.to_string body
+  | Ok (_resp, body) -> ()
   | Error err ->
     let err_str = Error.to_string_hum err in
     reject_cancel_order req addr w "%s" err_str;
@@ -1659,8 +1697,11 @@ let dtcserver ~server ~port =
     server (Tcp.on_port port) server_fun
 
 let update_trade { Trade.symbol; timestamp; price; size; side } =
+  let side = Option.value_map side ~default:`buy_sell_unset ~f:Side.of_string in
+  let price = Option.value ~default:0. price in
+  let size = Option.value ~default:0 size in
   Log.debug log_bitmex "trade %s %s %f %d" symbol (Side.show side) price size;
-  match side, Instrument.find symbol with
+  match side, Instr.find symbol with
   | `buy_sell_unset, _ -> ()
   | _, None ->
     Log.error log_bitmex "update_trade: found no instrument for %s" symbol
@@ -1694,21 +1735,21 @@ let update_trade { Trade.symbol; timestamp; price; size; side } =
 let on_update { Bmex_ws.Response.Update.table ; action ; data } =
   match action, table, data with
   | Update, Instrument, instrs ->
-    if Ivar.is_full Instrument.initialized then
-      List.iter instrs ~f:Instrument.update
+    if Ivar.is_full Instr.initialized then
+      List.iter instrs ~f:(Fn.compose Instr.update Instrument.of_yojson)
   | Delete, Instrument, instrs ->
-    if Ivar.is_full Instrument.initialized then
-      List.iter instrs ~f:Instrument.delete
+    if Ivar.is_full Instr.initialized then
+      List.iter instrs ~f:(Fn.compose Instr.delete Instrument.of_yojson)
   | _, Instrument, instrs ->
-    List.iter instrs ~f:Instrument.insert ;
-    Ivar.fill_if_empty Instrument.initialized ()
+    List.iter instrs ~f:(Fn.compose Instr.insert Instrument.of_yojson) ;
+    Ivar.fill_if_empty Instr.initialized ()
   | _, OrderBookL2, depths ->
-    let depths = List.map depths ~f:OrderBook.L2.of_yojson in
+    let depths = List.map depths ~f:OrderBookL2.of_yojson in
     let depths = List.group depths
         ~break:(fun { symbol } { symbol=symbol' } -> symbol <> symbol')
     in
     don't_wait_for begin
-      Ivar.read Instrument.initialized >>| fun () ->
+      Ivar.read Instr.initialized >>| fun () ->
       List.iter depths ~f:begin function
         | [] -> ()
         | h::t as ds ->
@@ -1720,7 +1761,7 @@ let on_update { Bmex_ws.Response.Update.table ; action ; data } =
   | _, Trade, trades ->
     let open Trade in
     don't_wait_for begin
-      Ivar.read Instrument.initialized >>| fun () ->
+      Ivar.read Instr.initialized >>| fun () ->
       List.iter trades ~f:(Fn.compose update_trade Trade.of_yojson)
     end
   | _, Quote, quotes ->
@@ -1827,7 +1868,7 @@ let main
     Log.info log_bitmex "WS feed starting";
     let bitmex_th = bitmex_ws () in
     Deferred.List.iter ~how:`Parallel ~f:Ivar.read
-      [Instrument.initialized; Books.initialized; Quotes.initialized] >>= fun () ->
+      [Instr.initialized; Books.initialized; Quotes.initialized] >>= fun () ->
     dtcserver ~server ~port >>= fun dtc_server ->
     Log.info log_dtc "DTC server started";
     Deferred.all_unit [Tcp.Server.close_finished dtc_server; bitmex_th]

@@ -7,6 +7,8 @@ open Cohttp_async
 
 open Bs_devkit
 open Bmex
+open Bitmex_types
+
 module REST = Bmex_rest
 module DTC = Dtc_pb.Dtcprotocol_piqi
 
@@ -30,12 +32,10 @@ let db_path symbol =
 let dbs = String.Table.create ()
 
 let load_instruments () =
-  let iter_instrument json =
-    let open RespObj in
-    let t = of_json json in
-    let key = string_exn t "symbol" in
-    String.Table.add_exn dbs ~key ~data:(DB.open_db @@ db_path key);
-    info "Opened DB %s" (string_exn t "symbol")
+  let iter_instrument t =
+    String.Table.add_exn dbs
+      ~key:t.Instrument.symbol ~data:(DB.open_db @@ db_path t.symbol);
+    info "Opened DB %s" t.symbol
   in
   REST.Instrument.active_and_indices
     ~buf ~log:(Lazy.force log) ~testnet:!use_testnet () >>|
@@ -47,6 +47,7 @@ let load_instruments () =
 let mk_store_trade_in_db () =
   let tss = String.Table.create () in
   fun { Trade.timestamp; symbol; price; size; side } ->
+    let side = Side.of_string (Option.value ~default:"" side) in
     if !dry_run || side = `buy_sell_unset then ()
     else
       let db = String.Table.find_or_add dbs symbol
@@ -60,9 +61,12 @@ let mk_store_trade_in_db () =
           String.Table.set tss symbol (timestamp, succ n);
           Time_ns.(add timestamp @@ Span.of_int_ns @@ succ n)
       in
-      let price = satoshis_int_of_float_exn price |> Int63.of_int in
-      let qty = Int63.of_int_exn size in
-      DB.store_trade_in_db db ~ts ~price ~qty ~side
+      match price, size with
+      | Some price, Some qty ->
+          let price = satoshis_int_of_float_exn price |> Int63.of_int in
+          let qty = Int63.of_int_exn qty in
+          DB.store_trade_in_db db ~ts ~price ~qty ~side
+      | _ -> ()
 
 let store_trade_in_db = mk_store_trade_in_db ()
 
