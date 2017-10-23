@@ -139,6 +139,11 @@ module Books = struct
           | None -> None
         end in
     match price, size with
+    | None, None | Some _, None | None, Some _ ->
+        let size = Option.value ~default:0 size in
+        let price = Option.value ~default:0. price in
+        Log.info log_bitmex
+          "update_depth: spurious %s %d %s %d %f" symbol id side size price
     | Some price, Some size ->
       begin match action with
         | Bmex_ws.Response.Update.Partial
@@ -172,8 +177,6 @@ module Books = struct
         Option.iter String.Table.(find subs_depth symbol) ~f:on_symbol_id
       in
       Connection.iter ~f:on_connection
-    | _ ->
-      Log.info log_bitmex "update_depth: received update before snapshot, ignoring"
 end
 
 module Instr = struct
@@ -343,17 +346,27 @@ module Quotes = struct
     Connection.iter ~f:on_connection
 end
 
+let log_error ?(f=ignore) log err =
+  match Error.to_exn err with
+  | Failure msg ->
+    f msg ;
+    Log.error log "%s" msg
+  | _ ->
+    let err_msg = (Error.to_string_hum err) in
+    f err_msg ;
+    Log.error log "%s" err_msg
+
 module TradeHistory = struct
   let buf = Bi_outbuf.create 4096
   let table : Execution.t Uuid.Map.t String.Table.t = String.Table.create ()
 
   let get ~key ~secret =
     let filter = `Assoc ["execType", `String "Trade"] in
-    REST.Execution.trade_history ~count:500
+    REST.Execution.trade_history ~extract_exn:true ~count:500
       ~buf ~log:log_bitmex ~testnet:!use_testnet
       ~filter ~key ~secret () >>| function
     | Error err ->
-      Log.error log_bitmex "%s" (Error.to_string_hum err) ;
+      log_error log_bitmex err ;
       Error err
     | Ok (resp, execs) ->
       let trades =
@@ -1110,7 +1123,7 @@ let historical_order_fills_request addr w msg =
       | Ok trades ->
         send_historical_order_fills_response req addr w trades ;
       | Error err ->
-        Log.error log_bitmex "%s" @@ Error.to_string_hum err ;
+        log_error log_bitmex err ;
         reject_historical_order_fills_request ?request_id:req.request_id w
           "Error fetching historical order fills from BitMEX"
     end
@@ -1248,13 +1261,15 @@ let submit_order w ~key ~secret (req : DTC.Submit_new_single_order.t) stop_exec_
       ~symbol ~orderQty ~ordType ~timeInForce ()
   in
   REST.Order.submit_bulk
+    ~extract_exn:true
     ~log:log_bitmex
     ~testnet:!use_testnet ~key ~secret [order] >>| function
-  | Ok _body -> ()
+  | Ok (resp, orders) ->
+      List.iter orders ~f:begin fun o ->
+        Log.sexp log_bitmex (Order.sexp_of_t o)
+      end
   | Error err ->
-    let err_str = Error.to_string_hum err in
-    reject_order req w "%s" err_str ;
-    Log.error log_bitmex "%s" err_str
+    log_error log_bitmex err ~f:(fun s -> reject_order req w "%s" s)
 
 let submit_new_single_order addr w msg =
   let req = DTC.parse_submit_new_single_order msg in
@@ -1308,12 +1323,11 @@ let amend_order addr w req key secret orderID ordType =
     ?price
     ?stopPx
     ~orderID () in
-  REST.Order.amend_bulk ~log:log_bitmex ~testnet:!use_testnet ~key ~secret [amend] >>| function
+  REST.Order.amend_bulk ~extract_exn:true ~log:log_bitmex ~testnet:!use_testnet ~key ~secret [amend] >>| function
   | Ok (_resp, body) -> ()
   | Error err ->
-    let err_str = Error.to_string_hum err in
-    reject_cancel_replace_order req addr w "%s" err_str;
-    Log.error log_bitmex "%s" err_str
+    log_error log_bitmex err
+      ~f:(fun s -> reject_cancel_replace_order req addr w "%s" s)
 
 let cancel_replace_order addr w msg =
   let req = DTC.parse_cancel_replace_order msg in
@@ -1354,23 +1368,21 @@ let reject_cancel_order (req : DTC.Cancel_order.t) addr w k =
 
 let cancel_solo_order req addr w key secret orderID =
   REST.Order.cancel
-    ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~orderIDs:[orderID] () >>| function
+    ~extract_exn:true ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~orderIDs:[orderID] () >>| function
   | Ok (_resp, body) -> ()
   | Error err ->
-    let err_str = Error.to_string_hum err in
-    reject_cancel_order req addr w "%s" err_str;
-    Log.error log_bitmex "%s" err_str
+    log_error log_bitmex err
+      ~f:(fun s -> reject_cancel_order req addr w "%s" s)
 
 let cancel_linked_orders req addr w key secret linkID =
   let filter = `Assoc ["clOrdLinkID", `String linkID] in
   REST.Order.cancel_all
-    ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
+    ~extract_exn:true ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
   | Ok _resp ->
     Log.debug log_bitmex "<- Cancel Order OK"
   | Error err ->
-    let err_str = Error.to_string_hum err in
-    reject_cancel_order req addr w "%s" err_str;
-    Log.error log_bitmex "%s" err_str
+    log_error log_bitmex err
+      ~f:(fun s -> reject_cancel_order req addr w "%s" s)
 
 let cancel_order addr w msg =
   let req = DTC.parse_cancel_order msg in
