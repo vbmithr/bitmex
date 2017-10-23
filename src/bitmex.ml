@@ -1295,13 +1295,18 @@ let submit_new_single_order addr w msg =
   end
   else don't_wait_for (submit_order w ~key ~secret req stop_exec_inst)
 
-let reject_cancel_replace_order (req : DTC.Cancel_replace_order.t) addr w k =
+let reject_cancel_replace_order
+    ?client_order_id
+    ?server_order_id
+    ~order_status
+    (req : DTC.Cancel_replace_order.t) addr w k =
   let rej = DTC.default_order_update () in
   rej.total_num_messages <- Some 1l ;
   rej.message_number <- Some 1l ;
   rej.order_update_reason <- Some `order_cancel_replace_rejected ;
-  rej.client_order_id <- req.client_order_id ;
-  rej.server_order_id <- req.server_order_id ;
+  rej.client_order_id <- client_order_id ;
+  rej.server_order_id <- Option.map server_order_id ~f:Uuid.to_string ;
+  rej.order_status <- Some order_status ;
   rej.order_type <- req.order_type ;
   rej.price1 <- req.price1 ;
   rej.price2 <- req.price2 ;
@@ -1314,7 +1319,7 @@ let reject_cancel_replace_order (req : DTC.Cancel_replace_order.t) addr w k =
     Log.debug log_dtc "-> [%s] Cancel Replace Rejected: %s" addr info_text
   end k
 
-let amend_order addr w req key secret orderID ordType =
+let amend_order addr w req key secret orderID ordType order_status =
   let price1 = if req.DTC.Cancel_replace_order.price1_is_set = Some true then req.price1 else None in
   let price2 = if req.price2_is_set = Some true then req.price2 else None in
   let price, stopPx = OrderType.to_price_stopPx ?p1:price1 ?p2:price2 ordType in
@@ -1326,8 +1331,11 @@ let amend_order addr w req key secret orderID ordType =
   REST.Order.amend_bulk ~extract_exn:true ~log:log_bitmex ~testnet:!use_testnet ~key ~secret [amend] >>| function
   | Ok (_resp, body) -> ()
   | Error err ->
-    log_error log_bitmex err
-      ~f:(fun s -> reject_cancel_replace_order req addr w "%s" s)
+    log_error log_bitmex err ~f:begin fun s ->
+      reject_cancel_replace_order
+        ~server_order_id:orderID
+        ~order_status req addr w "%s" s
+    end
 
 let cancel_replace_order addr w msg =
   let req = DTC.parse_cancel_replace_order msg in
@@ -1335,68 +1343,110 @@ let cancel_replace_order addr w msg =
   Log.debug log_dtc "<- [%s] Cancel Replace Order" addr ;
   let order_type = Option.value ~default:`order_type_unset req.order_type in
   let time_in_force = Option.value ~default:`tif_unset req.time_in_force in
-  if order_type <> `order_type_unset then
-    reject_cancel_replace_order req addr w
-      "Modification of order type is not supported by BitMEX"
-  else if time_in_force <> `tif_unset then
-    reject_cancel_replace_order req addr w
-      "Modification of time in force is not supported by BitMEX"
-  else
-    match Option.bind req.server_order_id ~f:begin fun orderID ->
-        Uuid.Table.find order (Uuid.of_string orderID)
-      end with
-    | None ->
-      reject_cancel_replace_order req addr w
-        "Cancel Replace Order: Order Not Found"
-    | Some o ->
-        let ordType =
-          Option.value_map ~default:`order_type_unset o.ordType ~f:OrderType.of_string in
-        don't_wait_for (amend_order addr w req key secret o.orderID ordType)
+  match Option.bind req.server_order_id ~f:begin fun orderID ->
+      Uuid.Table.find order (Uuid.of_string orderID)
+    end with
+  | None ->
+    reject_cancel_replace_order
+      ?client_order_id:req.client_order_id
+      ~order_status:`order_status_rejected req addr w
+      "Unknown ServerOrderID"
+  | Some o ->
+    let order_status =
+      Option.value_map ~default:`order_status_unspecified ~f:(Fn.compose OrdStatus.to_dtc OrdStatus.of_string) o.ordStatus in
+    let order_status = (order_status :> DTC.order_status_enum) in
+    if order_type <> `order_type_unset then
+      reject_cancel_replace_order
+        ~server_order_id:o.orderID
+        ~order_status req addr w
+        "Modification of order type is not supported by BitMEX"
+    else if time_in_force <> `tif_unset then
+      reject_cancel_replace_order
+        ~server_order_id:o.orderID
+        ~order_status req addr w
+        "Modification of time in force is not supported by BitMEX"
+    else
+      let ordType =
+        Option.value_map ~default:`order_type_unset o.ordType ~f:OrderType.of_string in
+      don't_wait_for begin
+        amend_order addr w req key secret o.orderID ordType order_status
+      end
 
-let reject_cancel_order (req : DTC.Cancel_order.t) addr w k =
+let reject_cancel_order
+  ?client_order_id
+  ?server_order_id
+  ~order_status
+  (req : DTC.Cancel_order.t) addr w k =
   let rej = DTC.default_order_update () in
   rej.total_num_messages <- Some 1l ;
   rej.message_number <- Some 1l ;
   rej.order_update_reason <- Some `order_cancel_rejected ;
-  rej.client_order_id <- req.client_order_id ;
-  rej.server_order_id <- req.server_order_id ;
+  rej.client_order_id <- client_order_id ;
+  rej.server_order_id <- Option.map server_order_id ~f:Uuid.to_string ;
+  rej.order_status <- Some order_status ;
   Printf.ksprintf begin fun info_text ->
     rej.info_text <- Some info_text ;
     write_message w `order_update DTC.gen_order_update rej ;
     Log.debug log_dtc "-> [%s] Cancel Rejected: %s" addr info_text
   end k
 
-let cancel_solo_order req addr w key secret orderID =
+let cancel_solo_order req addr w key secret o =
   REST.Order.cancel
-    ~extract_exn:true ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~orderIDs:[orderID] () >>| function
+    ~extract_exn:true ~log:log_bitmex ~testnet:!use_testnet
+    ~key ~secret ~orderIDs:[o.Order.orderID] () >>| function
   | Ok (_resp, body) -> ()
   | Error err ->
-    log_error log_bitmex err
-      ~f:(fun s -> reject_cancel_order req addr w "%s" s)
+    let order_status =
+      Option.value_map o.ordStatus
+        ~default:`order_status_unspecified
+        ~f:(Fn.compose OrdStatus.to_dtc OrdStatus.of_string) in
+    let order_status = (order_status :> DTC.order_status_enum) in
+    log_error log_bitmex err ~f:begin fun s ->
+      reject_cancel_order
+        ~order_status
+        ~server_order_id:o.orderID
+        req addr w "%s" s
+    end
 
-let cancel_linked_orders req addr w key secret linkID =
-  let filter = `Assoc ["clOrdLinkID", `String linkID] in
-  REST.Order.cancel_all
-    ~extract_exn:true ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function
-  | Ok _resp ->
-    Log.debug log_bitmex "<- Cancel Order OK"
-  | Error err ->
-    log_error log_bitmex err
-      ~f:(fun s -> reject_cancel_order req addr w "%s" s)
+(* let cancel_linked_orders req addr w key secret linkID order_status = *)
+(*   let filter = `Assoc ["clOrdLinkID", `String linkID] in *)
+(*   REST.Order.cancel_all *)
+(*     ~extract_exn:true ~log:log_bitmex ~testnet:!use_testnet ~key ~secret ~filter () >>| function *)
+(*   | Ok _resp -> *)
+(*     Log.debug log_bitmex "<- Cancel Order OK" *)
+(*   | Error err -> *)
+(*     log_error log_bitmex err *)
+(*       ~f:(fun s -> reject_cancel_order req addr w "%s" s) *)
 
 let cancel_order addr w msg =
   let req = DTC.parse_cancel_order msg in
-  let { Connection.key; secret; parents } = Connection.find_exn addr in
+  let { Connection.key; secret; parents ; order } = Connection.find_exn addr in
   Log.debug log_dtc "<- [%s] Cancel Order" addr ;
-  match req.server_order_id,
-        Option.(req.client_order_id >>= String.Table.find parents) with
-  | Some orderID, None ->
-    let orderID = Uuid.of_string orderID in
-    don't_wait_for (cancel_solo_order req addr w key secret orderID)
-  | Some orderID, Some linkID ->
-    don't_wait_for (cancel_linked_orders req addr w key secret linkID)
+  match Option.(req.server_order_id >>| Uuid.of_string >>= Uuid.Table.find order) with
+        (* , *)
+        (* Option.(req.client_order_id >>= String.Table.find parents) with *)
+  | Some o -> begin
+      match Option.map ~f:OrdStatus.of_string o.ordStatus with
+      | Some Canceled ->
+          reject_cancel_order
+          ~server_order_id:o.orderID
+          ~order_status:`order_status_canceled
+          req addr w "Order has already been canceled"
+      | Some PendingCancel ->
+          reject_cancel_order
+          ~server_order_id:o.orderID
+          ~order_status:`order_status_pending_cancel
+          req addr w "Order is pending cancel"
+      | _ ->
+        don't_wait_for (cancel_solo_order req addr w key secret o)
+    end
+  (* | Some orderID, Some linkID -> *)
+  (*   don't_wait_for (cancel_linked_orders req addr w key secret linkID) *)
   | _ ->
-    reject_cancel_order req addr w "Fatal: Missing order id"
+    reject_cancel_order
+      ?client_order_id:req.client_order_id
+      ~order_status:`order_status_rejected
+      req addr w "Unknown ServerOrderID"
 
 (* let process addr w msg_cs scratchbuf = *)
 (*   let addr_str = Socket.Address.Inet.to_string addr in *)
