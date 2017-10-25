@@ -606,92 +606,81 @@ type subscribe_msg =
 
 let client_ws_r, client_ws_w = Pipe.create ()
 
-let process_orders { Connection.addr ; order } partial_iv action orders =
-  List.iter orders ~f:begin fun o ->
-    match action with
-    | WS.Response.Update.Delete ->
-      Uuid.Table.remove order o.Order.orderID;
-      Log.debug log_bitmex "<- [%s] order delete" addr
-    | Insert
-    | Partial ->
-      Uuid.Table.set order ~key:o.orderID ~data:o;
-      Log.debug log_bitmex "<- [%s] order insert/partial" addr
-    | Update ->
-      if Ivar.is_full partial_iv then begin
-        let data = match Uuid.Table.find order o.orderID with
-          | None -> o
-          | Some old_o -> Order.merge old_o o
-        in
-        Uuid.Table.set order ~key:o.orderID ~data;
-        Log.debug log_bitmex "<- [%s] order update" addr
-      end
-  end;
-  if action = Partial then Ivar.fill_if_empty partial_iv ()
+let process_order { Connection.addr ; order } partial_iv action o =
+  match action with
+  | WS.Response.Update.Delete ->
+    Uuid.Table.remove order o.Order.orderID;
+    Log.debug log_bitmex "<- [%s] order delete" addr
+  | Insert
+  | Partial ->
+    Uuid.Table.set order ~key:o.orderID ~data:o;
+    Log.debug log_bitmex "<- [%s] order insert/partial" addr
+  | Update ->
+    if Ivar.is_full partial_iv then begin
+      let data = match Uuid.Table.find order o.orderID with
+        | None -> o
+        | Some old_o -> Order.merge old_o o
+      in
+      Uuid.Table.set order ~key:o.orderID ~data;
+      Log.debug log_bitmex "<- [%s] order update" addr
+    end
 
-let process_margins { Connection.addr ; w ; margin } partial_iv action margins =
-  List.iteri margins ~f:begin fun i m ->
-    match action with
-    | WS.Response.Update.Delete ->
-      String.Table.remove margin m.Margin.currency ;
-      Log.debug log_bitmex "<- [%s] margin delete" addr
-    | Insert
-    | Partial ->
+let process_margin ({ Connection.addr ; w ; margin } as c) partial_iv action i m =
+  match action with
+  | WS.Response.Update.Delete ->
+    String.Table.remove margin m.Margin.currency ;
+    Log.debug log_bitmex "<- [%s] margin delete" addr
+  | Insert
+  | Partial ->
+    String.Table.set margin ~key:m.currency ~data:m;
+    Log.debug log_bitmex "<- [%s] margin insert/partial" addr;
+    write_balance_update ~msg_number:1 ~nb_msgs:1 w m ;
+    if action = Partial then c.account <- m.account
+  | Update ->
+    if Ivar.is_full partial_iv then begin
+      let m = match String.Table.find margin m.currency with
+        | None -> m
+        | Some old_m -> Margin.merge old_m m
+      in
       String.Table.set margin ~key:m.currency ~data:m;
-      Log.debug log_bitmex "<- [%s] margin insert/partial" addr;
-      write_balance_update ~msg_number:1 ~nb_msgs:1 w m
-    | Update ->
-      if Ivar.is_full partial_iv then begin
-        let m = match String.Table.find margin m.currency with
-          | None -> m
-          | Some old_m -> Margin.merge old_m m
-        in
-        String.Table.set margin ~key:m.currency ~data:m;
-        write_balance_update ~msg_number:1 ~nb_msgs:1 w m ;
-        Log.debug log_bitmex "<- [%s] margin update" addr
-      end
-  end;
-  if action = Partial then Ivar.fill_if_empty partial_iv ()
+      write_balance_update ~msg_number:1 ~nb_msgs:1 w m ;
+      Log.debug log_bitmex "<- [%s] margin update" addr
+    end
 
-let process_positions { Connection.addr ; w ; position } partial_iv action positions =
-  List.iter positions ~f:begin fun p ->
-    match action with
-    | WS.Response.Update.Delete ->
-      String.Table.remove position p.Position.symbol ;
-      Log.debug log_bitmex "<- [%s] position delete" addr
-    | Insert | Partial ->
+let process_position { Connection.addr ; w ; position } partial_iv action p =
+  match action with
+  | WS.Response.Update.Delete ->
+    String.Table.remove position p.Position.symbol ;
+    Log.debug log_bitmex "<- [%s] position delete" addr
+  | Insert | Partial ->
+    String.Table.set position ~key:p.symbol ~data:p;
+    if Option.value ~default:false p.isOpen then begin
+      write_position_update ~nb_msgs:1 ~msg_number:1 w p ;
+      Log.debug log_bitmex "<- [%s] position insert/partial" addr ;
+    end
+  | Update ->
+    if Ivar.is_full partial_iv then begin
+      let old_p, p = match String.Table.find position p.symbol with
+        | None -> None, p
+        | Some old_p -> Some old_p, Position.merge old_p p
+      in
       String.Table.set position ~key:p.symbol ~data:p;
-      if Option.value ~default:false p.isOpen then begin
+      match old_p with
+      | Some old_p when Option.value ~default:false old_p.isOpen ->
         write_position_update ~nb_msgs:1 ~msg_number:1 w p ;
-        Log.debug log_bitmex "<- [%s] position insert/partial" addr
-      end
-    | Update ->
-      if Ivar.is_full partial_iv then begin
-        let old_p, p = match String.Table.find position p.symbol with
-          | None -> None, p
-          | Some old_p -> Some old_p, Position.merge old_p p
-        in
-        String.Table.set position ~key:p.symbol ~data:p;
-        match old_p with
-        | Some old_p when Option.value ~default:false old_p.isOpen ->
-          write_position_update ~nb_msgs:1 ~msg_number:1 w p ;
-          Log.debug log_dtc "<- [%s] position update %s" addr p.symbol
-        | _ -> ()
-      end
-  end;
-  if action = Partial then Ivar.fill_if_empty partial_iv ()
+        Log.debug log_dtc "<- [%s] position update %s" addr p.symbol
+      | _ -> ()
+    end
 
-let process_execs { Connection.addr ; w ; key } execs =
-  List.iter execs ~f:begin fun e ->
-      let execType = Option.map e.Execution.execType ~f:ExecType.of_string in
-      let ordStatus = Option.map e.ordStatus ~f:OrdStatus.of_string in
-      Option.iter e.symbol ~f:(fun s -> Log.debug log_bitmex "<- [%s] exec %s" addr s) ;
-      begin match execType, ordStatus with
-        | Some Trade, Some Filled -> TradeHistory.set ~key e
-        | _ -> ()
-      end ;
-      write_exec_update w e
-    end ;
-  Log.debug log_dtc "-> [%s] Sent Order Updates" addr
+let process_exec { Connection.addr ; w ; key ; account } e =
+  let execType = Option.map e.Execution.execType ~f:ExecType.of_string in
+  let ordStatus = Option.map e.ordStatus ~f:OrdStatus.of_string in
+  Option.iter e.symbol ~f:(fun s -> Log.debug log_bitmex "<- [%s] exec %s" addr s) ;
+  begin match execType, ordStatus with
+    | Some Trade, Some Filled -> TradeHistory.set ~account e
+    | _ -> ()
+  end ;
+  write_exec_update w e
 
 let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position; } as c) =
   let order_iv = Ivar.create () in
@@ -701,13 +690,17 @@ let client_ws ({ Connection.addr; w; ws_r; key; secret; order; margin; position;
   let on_update { WS.Response.Update.table; action; data } =
     match table, action, data with
     | Order, action, orders ->
-        process_orders c order_iv action (List.map ~f:Order.of_yojson orders)
+      List.iter ~f:(Fn.compose (process_order c order_iv action) Order.of_yojson) orders ;
+      if action = Partial then Ivar.fill_if_empty order_iv ()
     | Margin, action, margins ->
-        process_margins c margin_iv action (List.map ~f:Margin.of_yojson margins)
+      List.iteri ~f:(fun i m -> process_margin c margin_iv action i (Margin.of_yojson m)) margins ;
+      if action = Partial then Ivar.fill_if_empty margin_iv ()
     | Position, action, positions ->
-        process_positions c position_iv action (List.map ~f:Position.of_yojson positions)
+      List.iter ~f:(Fn.compose (process_position c position_iv action) Position.of_yojson) positions ;
+      if action = Partial then Ivar.fill_if_empty position_iv ()
     | Execution, action, execs ->
-        process_execs c (List.map ~f:Execution.of_yojson execs)
+      List.iter ~f:(Fn.compose (process_exec c) Execution.of_yojson) execs ;
+      Log.debug log_dtc "-> [%s] Sent Order Updates" addr
     | table, _, _ ->
         Log.error log_bitmex "Unknown table %s" (Bmex_ws.Topic.to_string table)
   in
