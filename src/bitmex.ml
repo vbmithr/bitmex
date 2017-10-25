@@ -42,6 +42,7 @@ module Connection = struct
     mutable ws_uuid: Uuid.t;
     key: string;
     secret: string;
+    mutable account: int;
     position: Position.t String.Table.t; (* indexed by symbol *)
     margin: Margin.t String.Table.t; (* indexed by currency *)
     order: Order.t Uuid.Table.t; (* indexed by orderID *)
@@ -57,7 +58,7 @@ module Connection = struct
   let create ~addr ~w ~key ~secret ~stop_exec_inst =
     let ws_r, ws_w = Pipe.create () in
     {
-      addr ; w ; ws_r ; ws_w ; key ; secret ;
+      addr ; w ; ws_r ; ws_w ; key ; secret ; account = 0 ;
       position = String.Table.create () ;
       margin = String.Table.create () ;
       order = Uuid.Table.create () ;
@@ -358,9 +359,9 @@ let log_error ?(f=ignore) log err =
 
 module TradeHistory = struct
   let buf = Bi_outbuf.create 4096
-  let table : Execution.t Uuid.Map.t String.Table.t = String.Table.create ()
+  let table : Execution.t Uuid.Map.t Int.Table.t = Int.Table.create ()
 
-  let get ~key ~secret =
+  let get ~account ~key ~secret =
     let filter = `Assoc ["execType", `String "Trade"] in
     REST.Execution.trade_history ~extract_exn:true ~count:500
       ~buf ~log:log_bitmex ~testnet:!use_testnet
@@ -375,7 +376,7 @@ module TradeHistory = struct
           | None -> a
           | Some orderID -> Uuid.Map.add a orderID e
         end in
-      String.Table.set table key trades ;
+      Int.Table.set table account trades ;
       Ok trades
 
   let filter_trades min_ts trades =
@@ -385,27 +386,27 @@ module TradeHistory = struct
       Time_ns.(ts > min_ts)
     end
 
-  let get ?(min_ts=Time_ns.epoch) ~key ~secret =
-    match String.Table.find table key with
+  let get ?(min_ts=Time_ns.epoch) ~account ~key ~secret =
+    match Int.Table.find table account with
     | Some trades ->
       Deferred.Or_error.return (filter_trades min_ts trades)
     | None ->
-      Deferred.Or_error.(get ~key ~secret >>| filter_trades min_ts)
+      Deferred.Or_error.(get ~account ~key ~secret >>| filter_trades min_ts)
 
-  let get_one ~key ~orderID =
+  let get_one ~account ~orderID =
     let open Option in
-    String.Table.find table key >>= fun trades ->
+    Int.Table.find table account >>= fun trades ->
     Uuid.Map.find trades orderID
 
-  let set ~key trade =
+  let set ~account trade =
     match trade.Execution.orderID with
     | None -> invalid_arg "TradeHistory.set"
     | Some orderID ->
         let data = Option.value_map
-            (String.Table.find table key)
+            (Int.Table.find table account)
             ~default:(Uuid.Map.singleton orderID trade)
             ~f:(Uuid.Map.add ~key:orderID ~data:trade) in
-        String.Table.set table ~key ~data
+        Int.Table.set table ~key:account ~data
 end
 
 let send_heartbeat { Connection.addr ; w } span =
@@ -1111,12 +1112,12 @@ let historical_order_fills_request addr w msg =
   let min_ts = Option.map req.number_of_days ~f:begin fun i ->
       Time_ns.(sub (now ()) (Span.of_day (Int32.to_float i)))
     end in
-  let { Connection.key ; secret } = Connection.find_exn addr in
+  let { Connection.key ; secret ; account} = Connection.find_exn addr in
   match Option.value ~default:"" req.server_order_id with
   | "" ->
     Log.debug log_dtc "<- [%s] Historical Order Fills Request" addr ;
     don't_wait_for begin
-      TradeHistory.get ?min_ts ~key ~secret >>| function
+      TradeHistory.get ?min_ts ~account ~key ~secret >>| function
       | Ok trades when Uuid.Map.is_empty trades ->
         write_no_historical_order_fills req w ;
         Log.debug log_dtc "-> [%s] No Order Fills" addr ;
@@ -1130,7 +1131,7 @@ let historical_order_fills_request addr w msg =
   | orderID_str -> begin
       let orderID = Uuid.of_string orderID_str in
       Log.debug log_dtc "<- [%s] Historical Order Fills Request for %s" addr orderID_str ;
-      match TradeHistory.get_one ~key ~orderID with
+      match TradeHistory.get_one ~account ~orderID with
       | None ->
         write_no_historical_order_fills req w ;
         Log.debug log_dtc "-> [%s] No Order Fills" addr ;
