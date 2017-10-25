@@ -120,10 +120,10 @@ module Books = struct
     let bids = String.Table.find_or_add bids symbol ~default:Int.Table.create in
     let asks = String.Table.find_or_add asks symbol ~default:Int.Table.create in
     let table =
-      match side with
-      | "Buy" -> bids
-      | "Sell" -> asks
-      | _ -> failwith "update_depth: empty side" in
+      match Side.of_string side with
+      | `buy -> bids
+      | `sell -> asks
+      | `buy_sell_unset -> failwith "update_depth: empty side" in
     let price =
       match price with
       | Some p -> Some p
@@ -159,10 +159,10 @@ module Books = struct
         | Update -> `market_depth_insert_update_level
         | Delete -> `market_depth_delete_level in
       let side =
-        match side with
-        | "Buy" -> Some `at_bid
-        | "Sell" -> Some `at_ask
-        | _ -> None
+        match Side.of_string side with
+        | `buy -> Some `at_bid
+        | `sell -> Some `at_ask
+        | `buy_sell_unset -> None
       in
       u.side <- side ;
       u.price <- Some price ;
