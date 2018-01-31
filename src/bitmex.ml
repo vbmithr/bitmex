@@ -8,19 +8,12 @@ open Bs_devkit
 open Bmex
 open Bitmex_types
 
-module DTC = Dtc_pb.Dtcprotocol_piqi
 module WS = Bmex_ws
 module REST = Bmex_rest
 
-let write_message w (typ : DTC.dtcmessage_type) gen msg =
-  let typ =
-    Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
-  let msg = (gen msg |> Piqirun.to_string) in
-  let header = Bytes.create 4 in
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
-  Writer.write w header ;
-  Writer.write w msg
+open Pbrt
+open Dtc_pb.Dtcprotocol_types
+open Dtc_pb.Dtcprotocol_pb
 
 let use_testnet = ref false
 let base_uri = ref @@ Uri.of_string "https://www.bitmex.com"
@@ -50,7 +43,7 @@ module Connection = struct
     rev_subs: string Int32.Table.t;
     subs_depth: int32 String.Table.t;
     rev_subs_depth: string Int32.Table.t;
-    mutable current_parent: DTC.Submit_new_single_order.t option;
+    mutable current_parent: submit_new_single_order option;
     parents: string String.Table.t;
     stop_exec_inst: ExecInst.t ;
   }
@@ -152,7 +145,6 @@ module Books = struct
         | Update -> Int.Table.set table id { size ; price }
         | Delete -> Int.Table.remove table id
       end;
-      let u = DTC.default_market_depth_update_level () in
       let update_type =
         match action with
         | Partial
@@ -161,14 +153,16 @@ module Books = struct
         | Delete -> `market_depth_delete_level in
       let side =
         match Side.of_string side with
-        | `buy -> Some `at_bid
-        | `sell -> Some `at_ask
+        | `buy -> Some At_bid
+        | `sell -> Some At_ask
         | `buy_sell_unset -> None
       in
-      u.side <- side ;
-      u.price <- Some price ;
-      u.quantity <- Some (Float.of_int size) ;
-      u.update_type <- Some update_type ;
+      let u = default_market_depth_update_level
+          ~side ~price ~quantity:(Float.of_int size) ~update_type () in
+      (* u.side <- side ;
+       * u.price <- Some price ;
+       * u.quantity <- Some (Float.of_int size) ;
+       * u.update_type <- Some update_type ; *)
       let on_connection { Connection.addr; w; subs; subs_depth } =
         let on_symbol_id symbol_id =
           u.symbol_id <- Some symbol_id ;

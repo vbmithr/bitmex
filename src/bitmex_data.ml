@@ -7,10 +7,10 @@ open Cohttp_async
 
 open Bs_devkit
 open Bmex
+open Bmex_common
 open Bitmex_types
 
 module REST = Bmex_rest
-module DTC = Dtc_pb.Dtcprotocol_piqi
 
 module DB = struct
   include Tick.MakeLDB(LevelDB)
@@ -69,16 +69,6 @@ let mk_store_trade_in_db () =
       | _ -> ()
 
 let store_trade_in_db = mk_store_trade_in_db ()
-
-let write_message w (typ : DTC.dtcmessage_type) gen msg =
-  let typ =
-    Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
-  let msg = (gen msg |> Piqirun.to_string) in
-  let header = Bytes.create 4 in
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
-  Writer.write w header ;
-  Writer.write w msg
 
 module Granulator = struct
   type t = {
