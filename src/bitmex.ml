@@ -7,20 +7,11 @@ open Cohttp_async
 open Bs_devkit
 open Bmex
 open Bitmex_types
+open Bmex_common
 
 module DTC = Dtc_pb.Dtcprotocol_piqi
 module WS = Bmex_ws
 module REST = Bmex_rest
-
-let write_message w (typ : DTC.dtcmessage_type) gen msg =
-  let typ =
-    Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
-  let msg = (gen msg |> Piqirun.to_string) in
-  let header = Bytes.create 4 in
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
-  Writer.write w header ;
-  Writer.write w msg
 
 let use_testnet = ref false
 let base_uri = ref @@ Uri.of_string "https://www.bitmex.com"
@@ -374,7 +365,7 @@ module TradeHistory = struct
         List.fold_left execs ~init:Uuid.Map.empty ~f:begin fun a e ->
           match e.orderID with
           | None -> a
-          | Some orderID -> Uuid.Map.add a orderID e
+          | Some orderID -> Uuid.Map.set a orderID e
         end in
       Int.Table.set table account trades ;
       Ok trades
@@ -405,7 +396,7 @@ module TradeHistory = struct
         let data = Option.value_map
             (Int.Table.find table account)
             ~default:(Uuid.Map.singleton orderID trade)
-            ~f:(Uuid.Map.add ~key:orderID ~data:trade) in
+            ~f:(Uuid.Map.set ~key:orderID ~data:trade) in
         Int.Table.set table ~key:account ~data
 end
 
@@ -1758,7 +1749,7 @@ let dtcserver ~server ~port =
   in
   Conduit_async.serve
     ~on_handler_error:(`Call on_handler_error_f)
-    server (Tcp.on_port port) server_fun
+    server (Tcp.Where_to_listen.of_port port) server_fun
 
 let update_trade { Trade.symbol; timestamp; price; size; side } =
   let side = Option.value_map side ~default:`buy_sell_unset ~f:Side.of_string in
@@ -1977,6 +1968,6 @@ let command =
     +> flag "-crt-file" (optional_with_default "ssl/bitsouk.com.crt" string) ~doc:"filename crt file to use (TLS)"
     +> flag "-key-file" (optional_with_default "ssl/bitsouk.com.key" string) ~doc:"filename key file to use (TLS)"
   in
-  Command.Staged.async ~summary:"BitMEX bridge" spec main
+  Command.Staged.async_spec ~summary:"BitMEX bridge" spec main
 
 let () = Command.run command
