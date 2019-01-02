@@ -252,7 +252,7 @@ let stream_tick_responses symbol
         | `buy -> `at_bid
         | `sell -> `at_ask
         | `buy_sell_unset -> `bid_ask_unset in
-      resp.date_time <- Some (float_of_ts t.ts) ;
+      resp.date_time <- Some (seconds_float_of_ts t.ts) ;
       resp.price <- Some p ;
       resp.volume <- Some v ;
       resp.at_bid_or_ask <- Some side ;
