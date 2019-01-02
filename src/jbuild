@@ -1,5 +1,0 @@
-(executables
- ((names (bitmex bitmex_data))
-  (public_names (bitmex bitmex-data))
-  (preprocess (pps (ppx_sexp_conv ppx_hash ppx_compare)))
-  (libraries (dtc-pb bs-devkit bitmex-types bmex-common bmex-rest bmex-ws tick leveldb))))
